@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+rom flask import Flask, request, jsonify
 import os
 import requests
 
@@ -18,15 +18,17 @@ def place_oanda_market_order(signal: str, pair: str):
         raise ValueError("Missing OANDA env vars")
 
     instrument = pair.replace("/", "_")
-    units = OANDA_UNITS if signal.upper() == "BUY" else -OANDA_UNITS
+    if instrument == "EURUSD":
+        instrument = "EUR_USD"
+
+    units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
 
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     headers = {
         "Authorization": f"Bearer {OANDA_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    body = {
+    payload = {
         "order": {
             "type": "MARKET",
             "instrument": instrument,
@@ -36,7 +38,7 @@ def place_oanda_market_order(signal: str, pair: str):
         }
     }
 
-    r = requests.post(url, headers=headers, json=body, timeout=30)
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
 @app.route("/webhook", methods=["POST"])
@@ -44,7 +46,7 @@ def webhook():
     data = request.get_json(force=True)
 
     signal = str(data.get("signal", "")).upper()
-    pair = str(data.get("pair", "EUR_USD")).replace("EURUSD", "EUR_USD")
+    pair = str(data.get("pair", "EUR_USD"))
     price = data.get("price")
     atr = data.get("atr")
 
