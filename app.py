@@ -1,13 +1,3 @@
-Enable desktop notifications for Gmail.
-   OK  No thanks
-1 of 1,880
-Bit
-Inbox
-
-Chris Pena <insulfion@gmail.com>
-11:07 PM (0 minutes ago)
-to me
-
 from flask import Flask, request
 
 app = Flask(__name__)
