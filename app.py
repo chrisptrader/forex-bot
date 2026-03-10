@@ -12,15 +12,9 @@ def webhook():
 
     signal = data.get("signal")
     pair = data.get("pair")
-    price = float(f"{float(data.get('price')):.5f}")
-    atr_value = data.get("atr")
-
-    if atr_value is None:
-        atr = 0.0005
-    else:
-        atr = float(atr_value)
+    price = data.get("price")
+    atr = data.get("atr")
 
     print(f"ALERT RECEIVED: {signal} {pair} Price: {price} ATR: {atr}")
 
     return {"status": "received"}, 200
-
