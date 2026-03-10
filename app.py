@@ -18,7 +18,7 @@ def webhook():
 if atr_value is None:
     atr = 0.0005
 else:
-    atr = float(atr_value
+    atr = float(atr_value)
     print(f"ALERT RECEIVED: {signal} {pair} Price: {price} ATR: {atr}")
     
     return {"status": "received"}, 200
