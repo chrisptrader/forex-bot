@@ -22,4 +22,4 @@ def webhook():
 
     print(f"ALERT RECEIVED: {signal} {pair} Price: {price} ATR: {atr}")
 
-    return {"status": "received"}, 200
+    return {"status":    "received"}, 200
