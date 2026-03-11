@@ -14,27 +14,67 @@ def home():
     return "Bot is running!"
 
 def place_oanda_market_order(signal: str, pair: str):
+
     if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
         raise ValueError("Missing OANDA env vars")
 
     instrument = pair.replace("/", "_")
+
     if instrument == "EURUSD":
         instrument = "EUR_USD"
 
     units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
 
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+
     headers = {
         "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
-    payload = {
+
+    data = {
         "order": {
-            "type": "MARKET",
             "instrument": instrument,
             "units": str(units),
-            "timeInForce": "FOK",
+            "type": "MARKET",
             "positionFill": "DEFAULT"
+        }
+    }
+
+    r = requests.post(url, headers=headers, json=data)
+
+    print("OANDA RESPONSE:", r.text)
+
+    return r.json()
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+
+    data = request.json
+
+    print("🚨 WEBHOOK RECEIVED:", data)
+
+    signal = data.get("signal")
+    pair = data.get("pair")
+
+    if not signal or not pair:
+        return jsonify({"error": "Missing signal or pair"}), 400
+
+    try:
+
+        result = place_oanda_market_order(signal, pair)
+
+        return jsonify({
+            "status": "order sent",
+            "oanda": result
+        })
+
+    except Exception as e:
+
+        print("ERROR:", str(e))
+
+        return jsonify({"error": str(e)}), 500            "positionFill": "DEFAULT"
         }
     }
 
