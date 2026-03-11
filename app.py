@@ -9,14 +9,13 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com")
 OANDA_UNITS = int(os.getenv("OANDA_UNITS", "100"))
 
+
 @app.route("/")
 def home():
     return "Bot is running!"
 
-def place_oanda_market_order(signal: str, pair: str):
 
-    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-        raise ValueError("Missing OANDA env vars")
+def place_oanda_market_order(signal, pair):
 
     instrument = pair.replace("/", "_")
 
@@ -53,58 +52,17 @@ def webhook():
 
     data = request.json
 
-    print("🚨 WEBHOOK RECEIVED:", data)
+    print("WEBHOOK RECEIVED:", data)
 
     signal = data.get("signal")
     pair = data.get("pair")
 
     if not signal or not pair:
-        return jsonify({"error": "Missing signal or pair"}), 400
+        return jsonify({"error": "missing signal or pair"}), 400
 
-    try:
+    result = place_oanda_market_order(signal, pair)
 
-        result = place_oanda_market_order(signal, pair)
-
-        return jsonify({
-            "status": "order sent",
-            "oanda": result
-        })
-
-    except Exception as e:
-
-        print("ERROR:", str(e))
-
-        return jsonify({"error": str(e)}), 500            "positionFill": "DEFAULT"
-        }
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    return r.status_code, r.text
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-
-    signal = str(data.get("signal", "")).upper()
-    pair = str(data.get("pair", "EUR_USD"))
-    price = data.get("price")
-    atr = data.get("atr")
-
-    print(f"ALERT RECEIVED: {signal} {pair} Price: {price} ATR: {atr}")
-
-    if signal not in {"BUY", "SELL"}:
-        return jsonify({"error": "signal must be BUY or SELL"}), 400
-
-    try:
-        status_code, response_text = place_oanda_market_order(signal, pair)
-        print(f"OANDA RESPONSE {status_code}: {response_text}")
-        return jsonify({"status": "received", "oanda_status": status_code}), 200
-    except Exception as e:
-        print(f"OANDA ERROR: {e}")
-        return jsonify({"error": str(e)}), 500
-
-import os
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    return jsonify({
+        "status": "order sent",
+        "oanda": result
+    })
