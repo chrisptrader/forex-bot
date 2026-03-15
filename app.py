@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 import os
 import requests
@@ -18,22 +19,22 @@ PAIR_CONFIG = {
         "sl_distance": 0.0020,
         "tp_distance": 0.0040,
         "pip_value_per_unit": 0.0001,
-        "max_units": 100000,
+        "max_units": 100000
     },
     "GBPUSD": {
         "instrument": "GBP_USD",
         "sl_distance": 0.0025,
         "tp_distance": 0.0050,
         "pip_value_per_unit": 0.0001,
-        "max_units": 100000,
+        "max_units": 100000
     },
     "XAUUSD": {
         "instrument": "XAU_USD",
         "sl_distance": 10.0,
         "tp_distance": 20.0,
         "pip_value_per_unit": 1.0,
-        "max_units": 100,
-    },
+        "max_units": 100
+    }
 }
 
 
@@ -45,41 +46,43 @@ def home():
 def oanda_headers():
     return {
         "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
 
 
 def get_account_summary():
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
-    r = requests.get(url, headers=oanda_headers(), timeout=15)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(url, headers=oanda_headers(), timeout=15)
+    response.raise_for_status()
+    return response.json()
 
 
 def get_open_trades():
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
-    r = requests.get(url, headers=oanda_headers(), timeout=15)
-    r.raise_for_status()
-    return r.json().get("trades", [])
+    response = requests.get(url, headers=oanda_headers(), timeout=15)
+    response.raise_for_status()
+    return response.json().get("trades", [])
 
 
-def pair_has_open_trade(instrument: str) -> bool:
-    for trade in get_open_trades():
+def pair_has_open_trade(instrument):
+    trades = get_open_trades()
+    for trade in trades:
         if trade.get("instrument") == instrument:
             return True
     return False
 
 
-def total_open_trades() -> int:
+def total_open_trades():
     return len(get_open_trades())
 
 
-def get_balance() -> float:
+def get_balance():
     summary = get_account_summary()
-    return float(summary.get("account", {}).get("balance", 0))
+    account = summary.get("account", {})
+    return float(account.get("balance", 0))
 
 
-def calculate_units(pair: str, signal: str) -> int:
+def calculate_units(pair, signal):
     cfg = PAIR_CONFIG[pair]
     balance = get_balance()
     risk_amount = balance * (RISK_PERCENT / 100.0)
@@ -97,7 +100,7 @@ def calculate_units(pair: str, signal: str) -> int:
     return units
 
 
-def place_oanda_market_order(signal: str, pair: str):
+def place_oanda_market_order(signal, pair):
     if pair not in PAIR_CONFIG:
         return {"error": f"unsupported pair: {pair}"}, 400
 
@@ -123,22 +126,22 @@ def place_oanda_market_order(signal: str, pair: str):
             },
             "takeProfitOnFill": {
                 "distance": str(cfg["tp_distance"])
-            },
+            }
         }
     }
 
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    r = requests.post(url, headers=oanda_headers(), json=payload, timeout=20)
+    response = requests.post(url, headers=oanda_headers(), json=payload, timeout=20)
 
     print("ORDER PAYLOAD:", payload)
-    print("OANDA RESPONSE:", r.text)
+    print("OANDA RESPONSE:", response.text)
 
     try:
-        data = r.json()
+        data = response.json()
     except Exception:
-        data = {"raw_response": r.text}
+        data = {"raw_response": response.text}
 
-    return data, r.status_code
+    return data, response.status_code
 
 
 @app.route("/webhook", methods=["POST"])
@@ -164,8 +167,13 @@ def webhook():
             "status": "processed",
             "signal": signal,
             "pair": pair,
-            "result": result,
+            "result": result
         }), status_code
     except Exception as e:
         print("BOT ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
