@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import os
 import requests
@@ -42,16 +41,30 @@ PAIR_CONFIG = {
 def home():
     return "Bot is running!", 200
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json(silent=True)
+    print("WEBHOOK RECEIVED:", data)
 
-    signal = data.get("signal")
-    pair = data.get("pair")
+    if not data:
+        return jsonify({"error": "missing json body"}), 400
 
-    print(f"Signal received: {signal} on {pair}")
+    signal = str(data.get("signal", "")).upper().strip()
+    pair = str(data.get("pair", "")).upper().replace("/", "").strip()
 
-    return {"status": "signal received"
+    if signal not in ["BUY", "SELL"]:
+        return jsonify({"error": "signal must be BUY or SELL"}), 400
+
+    if pair not in PAIR_CONFIG:
+        return jsonify({"error": f"unsupported pair: {pair}"}), 400
+
+    return jsonify({
+        "status": "signal received",
+        "signal": signal,
+        "pair": pair
+    }), 200
+
 
 def oanda_headers():
     return {
@@ -152,36 +165,6 @@ def place_oanda_market_order(signal, pair):
         data = {"raw_response": response.text}
 
     return data, response.status_code
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True)
-    print("WEBHOOK RECEIVED:", data)
-
-    if not data:
-        return jsonify({"error": "missing json body"}), 400
-
-    signal = str(data.get("signal", "")).upper().strip()
-    pair = str(data.get("pair", "")).upper().replace("/", "").strip()
-
-    if signal not in ["BUY", "SELL"]:
-        return jsonify({"error": "signal must be BUY or SELL"}), 400
-
-    if pair not in PAIR_CONFIG:
-        return jsonify({"error": f"unsupported pair: {pair}"}), 400
-
-    try:
-        result, status_code = place_oanda_market_order(signal, pair)
-        return jsonify({
-            "status": "processed",
-            "signal": signal,
-            "pair": pair,
-            "result": result
-        }), status_code
-    except Exception as e:
-        print("BOT ERROR:", str(e))
-        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
