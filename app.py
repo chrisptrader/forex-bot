@@ -42,6 +42,16 @@ PAIR_CONFIG = {
 def home():
     return "Bot is running!", 200
 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+
+    signal = data.get("signal")
+    pair = data.get("pair")
+
+    print(f"Signal received: {signal} on {pair}")
+
+    return {"status": "signal received"
 
 def oanda_headers():
     return {
