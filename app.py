@@ -1,147 +1,103 @@
+
 from flask import Flask, request, jsonify
 import os
 import requests
 
 app = Flask(__name__)
 
-# =========================
-# ENV VARIABLES
-# =========================
+OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
-OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com")
+OANDA_UNITS = int(os.getenv("OANDA_UNITS", "1000"))
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
-MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
+PAIR_MAP = {
+    "EURUSD": "EUR_USD",
+    "GBPUSD": "GBP_USD",
+    "XAUUSD": "XAU_USD",
+}
 
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-SESSION_START_HOUR = int(os.getenv("SESSION_START_HOUR", "4"))
-SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "11"))
-SESSION_TIMEZONE = os.getenv("SESSION_TIMEZONE", "America/New_York")
+def oanda_headers():
+    return {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-# =========================
-# HOME ROUTE
-# =========================
+
+def get_account_summary():
+    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return {"connected": False, "reason": "Missing OANDA credentials"}
+
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
+    r = requests.get(url, headers=oanda_headers(), timeout=20)
+
+    try:
+        data = r.json()
+    except Exception:
+        return {
+            "connected": False,
+            "reason": f"Non-JSON response: {r.text[:200]}"
+        }
+
+    if r.status_code >= 300:
+        return {
+            "connected": False,
+            "reason": data
+        }
+
+    account = data.get("account", {})
+    return {
+        "connected": True,
+        "balance": account.get("balance"),
+        "nav": account.get("NAV"),
+        "currency": account.get("currency"),
+        "marginAvailable": account.get("marginAvailable"),
+    }
+
 
 @app.route("/", methods=["GET"])
 def home():
     return "Bot is running!", 200
 
 
-# =========================
-# STATUS ROUTE
-# =========================
-
 @app.route("/status", methods=["GET"])
 def status():
-    try:
+    return jsonify({
+        "bot": "running",
+        "oanda": get_account_summary(),
+        "account_id_set": bool(OANDA_ACCOUNT_ID),
+        "api_key_set": bool(OANDA_API_KEY),
+        "base_url": OANDA_BASE_URL,
+        "units": OANDA_UNITS,
+        "supported_pairs": list(PAIR_MAP.keys()),
+    }), 200
 
-        account_info = get_account()
-
-        return jsonify({
-            "bot": "running",
-            "account": account_info,
-            "risk_percent": RISK_PERCENT,
-            "max_open_trades": MAX_OPEN_TRADES,
-            "max_trades_per_day": MAX_TRADES_PER_DAY,
-            "max_daily_loss_percent": MAX_DAILY_LOSS_PERCENT,
-            "cooldown_minutes": COOLDOWN_MINUTES,
-            "session_start_hour": SESSION_START_HOUR,
-            "session_end_hour": SESSION_END_HOUR,
-            "session_timezone": SESSION_TIMEZONE
-        })
-
-    except Exception as e:
-        return jsonify({
-            "bot": "running",
-            "error": str(e)
-        })
-
-
-# =========================
-# OANDA ACCOUNT
-# =========================
-
-def get_account():
-
-    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
-
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}"
-    }
-
-    r = requests.get(url, headers=headers)
-
-    data = r.json()
-
-    account = data["account"]
-
-    return {
-        "balance": account["balance"],
-        "NAV": account["NAV"],
-        "currency": account["currency"]
-    }
-
-
-# =========================
-# WEBHOOK ROUTE
-# =========================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    data = request.json
+    data = request.get_json(silent=True)
 
     if not data:
-        return {"error": "No JSON"}, 400
+        return jsonify({"error": "Missing JSON body"}), 400
 
-    pair = data.get("pair")
-    signal = data.get("signal")
+    signal = str(data.get("signal", "")).upper().strip()
+    pair = str(data.get("pair", "")).upper().replace("/", "").strip()
 
-    if not pair or not signal:
-        return {"error": "Missing pair or signal"}, 400
+    if signal not in ["BUY", "SELL"]:
+        return jsonify({"error": "signal must be BUY or SELL"}), 400
 
-    print("Signal received:", pair, signal)
+    if pair not in PAIR_MAP:
+        return jsonify({
+            "error": "unsupported pair",
+            "supported_pairs": list(PAIR_MAP.keys())
+        }), 400
 
-    try:
+    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+        return jsonify({"error": "Missing OANDA credentials in Render"}), 400
 
-        order = place_trade(pair, signal)
-
-        return {
-            "status": "order_sent",
-            "pair": pair,
-            "signal": signal,
-            "order": order
-        }
-
-    except Exception as e:
-
-        return {"error": str(e)}
-
-
-# =========================
-# PLACE TRADE
-# =========================
-
-def place_trade(pair, signal):
-
-    instrument = pair.replace("/", "_")
-
-    units = 1000
-
-    if signal.upper() == "SELL":
-        units = -units
-
-    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    instrument = PAIR_MAP[pair]
+    units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
 
     payload = {
         "order": {
@@ -152,14 +108,22 @@ def place_trade(pair, signal):
         }
     }
 
-    r = requests.post(url, headers=headers, json=payload)
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+    r = requests.post(url, headers=oanda_headers(), json=payload, timeout=20)
 
-    return r.json()
+    try:
+        result = r.json()
+    except Exception:
+        result = {"raw_response": r.text}
 
+    return jsonify({
+        "status_code": r.status_code,
+        "pair": pair,
+        "signal": signal,
+        "units": units,
+        "result": result
+    }), r.status_code
 
-# =========================
-# RUN APP
-# =========================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
