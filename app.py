@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import os
 import requests
@@ -8,74 +7,50 @@ app = Flask(__name__)
 OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
-
 OANDA_UNITS = int(os.getenv("OANDA_UNITS", "1000"))
 
 PAIR_MAP = {
     "EURUSD": "EUR_USD",
     "GBPUSD": "GBP_USD",
-    "XAUUSD": "XAU_USD",
+    "XAUUSD": "XAU_USD"
 }
-
 
 def oanda_headers():
     return {
         "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
-
 
 def get_account_summary():
-    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-        return {"connected": False, "reason": "Missing OANDA credentials"}
+    if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
+        return {"error": "Missing API credentials"}
 
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
-    r = requests.get(url, headers=oanda_headers(), timeout=20)
+    r = requests.get(url, headers=oanda_headers())
 
     try:
-        data = r.json()
-    except Exception:
-        return {
-            "connected": False,
-            "reason": f"Non-JSON response: {r.text[:200]}"
-        }
+        return r.json()
+    except:
+        return {"error": "Could not parse response"}
 
-    if r.status_code >= 300:
-        return {
-            "connected": False,
-            "reason": data
-        }
-
-    account = data.get("account", {})
-    return {
-        "connected": True,
-        "balance": account.get("balance"),
-        "nav": account.get("NAV"),
-        "currency": account.get("currency"),
-        "marginAvailable": account.get("marginAvailable"),
-    }
-
-
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-    return "Bot is running!", 200
-
+    return "Forex bot is running!"
 
 @app.route("/status", methods=["GET"])
 def status():
     return jsonify({
         "bot": "running",
-        "oanda": get_account_summary(),
         "account_id_set": bool(OANDA_ACCOUNT_ID),
         "api_key_set": bool(OANDA_API_KEY),
         "base_url": OANDA_BASE_URL,
         "units": OANDA_UNITS,
-        "supported_pairs": list(PAIR_MAP.keys()),
+        "supported_pairs": list(PAIR_MAP.keys())
     }), 200
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+
     data = request.get_json(silent=True)
 
     if not data:
@@ -85,35 +60,31 @@ def webhook():
     pair = str(data.get("pair", "")).upper().replace("/", "").strip()
 
     if signal not in ["BUY", "SELL"]:
-        return jsonify({"error": "signal must be BUY or SELL"}), 400
+        return jsonify({"error": "Signal must be BUY or SELL"}), 400
 
     if pair not in PAIR_MAP:
-        return jsonify({
-            "error": "unsupported pair",
-            "supported_pairs": list(PAIR_MAP.keys())
-        }), 400
-
-    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-        return jsonify({"error": "Missing OANDA credentials in Render"}), 400
+        return jsonify({"error": "Unsupported pair"}), 400
 
     instrument = PAIR_MAP[pair]
     units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
 
     payload = {
         "order": {
-            "instrument": instrument,
             "units": str(units),
+            "instrument": instrument,
+            "timeInForce": "FOK",
             "type": "MARKET",
             "positionFill": "DEFAULT"
         }
     }
 
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    r = requests.post(url, headers=oanda_headers(), json=payload, timeout=20)
+
+    r = requests.post(url, headers=oanda_headers(), json=payload)
 
     try:
         result = r.json()
-    except Exception:
+    except:
         result = {"raw_response": r.text}
 
     return jsonify({
