@@ -2,13 +2,24 @@ from flask import Flask, request, jsonify
 import os
 import requests
 import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
+# =========================
+# ENV
+# =========================
 OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
+
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+SESSION_TIMEZONE = os.getenv("SESSION_TIMEZONE", "America/New_York")
 
 PAIR_MAP = {
     "EURUSD": {
@@ -34,6 +45,32 @@ PAIR_MAP = {
     }
 }
 
+# =========================
+# IN-MEMORY STATE
+# =========================
+STATE = {
+    "daily_date": None,
+    "daily_start_nav": None,
+    "trades_today": 0,
+    "last_signal_key": None,
+    "last_signal_time": None
+}
+
+
+# =========================
+# HELPERS
+# =========================
+def now_local():
+    return datetime.now(ZoneInfo(SESSION_TIMEZONE))
+
+
+def reset_daily_state_if_needed():
+    today = now_local().date().isoformat()
+    if STATE["daily_date"] != today:
+        STATE["daily_date"] = today
+        STATE["daily_start_nav"] = None
+        STATE["trades_today"] = 0
+
 
 def oanda_headers():
     return {
@@ -57,12 +94,29 @@ def get_account_summary():
 
 def get_account_nav():
     data = get_account_summary()
+    account = data.get("account")
 
-    if "account" not in data:
+    if not account:
         raise Exception(f"OANDA account error: {data}")
 
-    nav = float(data["account"]["NAV"])
+    nav = float(account["NAV"])
     return nav
+
+
+def get_open_trades():
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
+    r = requests.get(url, headers=oanda_headers(), timeout=20)
+
+    try:
+        data = r.json()
+    except Exception:
+        return []
+
+    return data.get("trades", [])
+
+
+def total_open_trades():
+    return len(get_open_trades())
 
 
 def calculate_units(pair, signal):
@@ -89,6 +143,40 @@ def calculate_units(pair, signal):
     return units
 
 
+def duplicate_signal(signal, pair):
+    key = f"{signal}:{pair}"
+    if STATE["last_signal_key"] != key or STATE["last_signal_time"] is None:
+        return False
+
+    elapsed = (now_local() - STATE["last_signal_time"]).total_seconds() / 60.0
+    return elapsed < COOLDOWN_MINUTES
+
+
+def remember_signal(signal, pair):
+    STATE["last_signal_key"] = f"{signal}:{pair}"
+    STATE["last_signal_time"] = now_local()
+
+
+def daily_loss_hit():
+    reset_daily_state_if_needed()
+
+    nav = get_account_nav()
+
+    if STATE["daily_start_nav"] is None:
+        STATE["daily_start_nav"] = nav
+        return False, 0.0
+
+    start_nav = STATE["daily_start_nav"]
+    if start_nav <= 0:
+        return False, 0.0
+
+    drawdown_percent = ((start_nav - nav) / start_nav) * 100.0
+    return drawdown_percent >= MAX_DAILY_LOSS_PERCENT, drawdown_percent
+
+
+# =========================
+# ROUTES
+# =========================
 @app.route("/", methods=["GET"])
 def home():
     return "Forex bot is running!", 200
@@ -96,27 +184,33 @@ def home():
 
 @app.route("/status", methods=["GET"])
 def status():
+    reset_daily_state_if_needed()
+
+    account_summary = get_account_summary()
+    open_trades = get_open_trades()
+
     return jsonify({
         "bot": "running",
         "account_id_set": bool(OANDA_ACCOUNT_ID),
         "api_key_set": bool(OANDA_API_KEY),
         "base_url": OANDA_BASE_URL,
         "risk_percent": RISK_PERCENT,
+        "max_open_trades": MAX_OPEN_TRADES,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "max_daily_loss_percent": MAX_DAILY_LOSS_PERCENT,
+        "cooldown_minutes": COOLDOWN_MINUTES,
         "supported_pairs": list(PAIR_MAP.keys()),
-        "pair_settings": {
-            pair: {
-                "instrument": info["instrument"],
-                "sl_distance": info["sl_distance"],
-                "tp_distance": info["tp_distance"],
-                "max_units": info["max_units"]
-            }
-            for pair, info in PAIR_MAP.items()
-        }
+        "trades_today": STATE["trades_today"],
+        "open_trades_count": len(open_trades),
+        "daily_start_nav": STATE["daily_start_nav"],
+        "account_summary": account_summary
     }), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    reset_daily_state_if_needed()
+
     data = request.get_json(silent=True)
 
     if not data:
@@ -136,6 +230,39 @@ def webhook():
 
     if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
         return jsonify({"error": "Missing OANDA credentials"}), 400
+
+    # safety 1: duplicate/cooldown protection
+    if duplicate_signal(signal, pair):
+        return jsonify({
+            "status": "blocked",
+            "reason": "Duplicate signal / cooldown active"
+        }), 200
+
+    # safety 2: max open trades
+    open_count = total_open_trades()
+    if open_count >= MAX_OPEN_TRADES:
+        return jsonify({
+            "status": "blocked",
+            "reason": "Max open trades reached",
+            "open_trades_count": open_count
+        }), 200
+
+    # safety 3: max trades per day
+    if STATE["trades_today"] >= MAX_TRADES_PER_DAY:
+        return jsonify({
+            "status": "blocked",
+            "reason": "Max trades per day reached",
+            "trades_today": STATE["trades_today"]
+        }), 200
+
+    # safety 4: daily loss stop
+    loss_hit, drawdown_percent = daily_loss_hit()
+    if loss_hit:
+        return jsonify({
+            "status": "blocked",
+            "reason": "Daily loss limit hit",
+            "drawdown_percent": round(drawdown_percent, 2)
+        }), 200
 
     pair_info = PAIR_MAP[pair]
     instrument = pair_info["instrument"]
@@ -171,6 +298,10 @@ def webhook():
     except Exception:
         result = {"raw_response": r.text}
 
+    if r.status_code < 300:
+        STATE["trades_today"] += 1
+        remember_signal(signal, pair)
+
     return jsonify({
         "status_code": r.status_code,
         "pair": pair,
@@ -179,6 +310,7 @@ def webhook():
         "units": units,
         "stop_loss_distance": sl_distance,
         "take_profit_distance": tp_distance,
+        "trades_today": STATE["trades_today"],
         "result": result
     }), r.status_code
 
@@ -186,4 +318,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
