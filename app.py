@@ -1,5 +1,4 @@
 
-
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -23,22 +22,24 @@ OANDA_UNITS = int(os.environ.get("OANDA_UNITS", "1000"))
 # Allowed instruments
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
-# Risk / management
-MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", "3"))
-PAIR_COOLDOWN_SECONDS = int(os.environ.get("PAIR_COOLDOWN_SECONDS", "300")) # 5 min
+# Trade management
+MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", "1"))
+PAIR_COOLDOWN_SECONDS = int(os.environ.get("PAIR_COOLDOWN_SECONDS", "300"))
+
+# Trailing stop
 ENABLE_TRAILING = os.environ.get("TRAILING_STOP", "true").lower() == "true"
+TRAILING_PIPS = float(os.environ.get("TRAILING_PIPS", "15"))
 
 # Session filter
 SESSION_TIMEZONE = os.environ.get("SESSION_TIMEZONE", "America/New_York")
 SESSION_START_HOUR = int(os.environ.get("SESSION_START_HOUR", "7"))
 SESSION_END_HOUR = int(os.environ.get("SESSION_END_HOUR", "17"))
 
-# SL / TP
+# Risk protection
 STOP_LOSS_PIPS = float(os.environ.get("STOP_LOSS_PIPS", "20"))
 TAKE_PROFIT_PIPS = float(os.environ.get("TAKE_PROFIT_PIPS", "40"))
-TRAILING_PIPS = float(os.environ.get("TRAILING_PIPS", "15"))
 
-# In-memory cooldown tracker
+# Simple memory
 last_trade_time_by_pair = {}
 
 # =========================
@@ -64,10 +65,9 @@ def oanda_headers():
     }
 
 
-def is_session_open() -> bool:
+def is_session_open():
     now_local = datetime.now(ZoneInfo(SESSION_TIMEZONE))
-    hour = now_local.hour
-    return SESSION_START_HOUR <= hour < SESSION_END_HOUR
+    return SESSION_START_HOUR <= now_local.hour < SESSION_END_HOUR
 
 
 def pip_size(pair: str) -> float:
@@ -85,10 +85,17 @@ def format_price(pair: str, price: float) -> str:
 def get_account_summary():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
     response = requests.get(url, headers=oanda_headers(), timeout=20)
-    data = response.json()
+
+    try:
+        data = response.json()
+    except Exception:
+        raise Exception(f"Could not decode account summary: {response.text}")
+
     print("Account summary response:", data)
+
     if response.status_code >= 300:
         raise Exception(f"OANDA account summary error: {data}")
+
     return data.get("account", {})
 
 
@@ -109,11 +116,29 @@ def get_open_trades():
     return data.get("trades", [])
 
 
+def count_open_trades():
+    return len(get_open_trades())
+
+
+def get_open_trade_for_pair(pair: str):
+    trades = get_open_trades()
+    for trade in trades:
+        if trade.get("instrument") == pair:
+            return trade
+    return None
+
+
 def get_pricing(pair: str):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
     response = requests.get(url, headers=oanda_headers(), timeout=20)
-    data = response.json()
+
+    try:
+        data = response.json()
+    except Exception:
+        raise Exception(f"Could not decode pricing response: {response.text}")
+
     print("Pricing response:", data)
+
     if response.status_code >= 300:
         raise Exception(f"OANDA pricing error: {data}")
 
@@ -121,9 +146,8 @@ def get_pricing(pair: str):
     if not prices:
         raise Exception(f"No pricing returned for {pair}")
 
-    price_obj = prices[0]
-    bid = float(price_obj["bids"][0]["price"])
-    ask = float(price_obj["asks"][0]["price"])
+    bid = float(prices[0]["bids"][0]["price"])
+    ask = float(prices[0]["asks"][0]["price"])
     return bid, ask
 
 
@@ -142,29 +166,6 @@ def build_sl_tp(signal: str, pair: str):
     return format_price(pair, sl), format_price(pair, tp)
 
 
-def count_open_trades():
-    return len(get_open_trades())
-
-
-def get_open_trade_for_pair(pair: str):
-    trades = get_open_trades()
-    for trade in trades:
-        if trade.get("instrument") == pair:
-            return trade
-    return None
-
-
-def close_trade(trade_id: str):
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/close"
-    response = requests.put(url, headers=oanda_headers(), timeout=20)
-    try:
-        result = response.json()
-    except Exception:
-        result = {"raw_text": response.text}
-    print("Close trade result:", result)
-    return result
-
-
 def should_block_for_cooldown(pair: str):
     now_ts = time.time()
     last_ts = last_trade_time_by_pair.get(pair)
@@ -177,31 +178,59 @@ def remember_trade_time(pair: str):
     last_trade_time_by_pair[pair] = time.time()
 
 
+def close_trade(trade_id: str):
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/close"
+    response = requests.put(url, headers=oanda_headers(), timeout=20)
+
+    try:
+        result = response.json()
+    except Exception:
+        result = {"raw_text": response.text}
+
+    print("Close trade result:", result)
+    return result
+
+
+def should_trade(signal: str, pair: str):
+    # Starter filter:
+    # trade only during session and only allowed pairs
+    if not is_session_open():
+        return False, "Outside trading session"
+
+    if pair not in PAIRS:
+        return False, "Pair not allowed"
+
+    return True, "OK"
+
+
 def place_trade(signal: str, pair: str):
     pair = normalize_pair(pair)
 
-    if pair not in PAIRS:
-        return {"error": f"Pair not allowed: {pair}"}
-
-    if not is_session_open():
-        return {"blocked": True, "reason": "Outside trading session"}
+    allowed, reason = should_trade(signal, pair)
+    if not allowed:
+        return {"blocked": True, "reason": reason}
 
     if should_block_for_cooldown(pair):
         return {"blocked": True, "reason": f"Cooldown active for {pair}"}
 
     if count_open_trades() >= MAX_OPEN_TRADES:
-        return {"blocked": True, "reason": "Max open trades reached"}
+        existing_trade = get_open_trade_for_pair(pair)
+
+        if not existing_trade:
+            return {"blocked": True, "reason": "Max open trades reached"}
 
     existing_trade = get_open_trade_for_pair(pair)
 
     if existing_trade:
         current_units = float(existing_trade.get("currentUnits", "0"))
+
+        # Same direction already open
         if (signal == "BUY" and current_units > 0) or (signal == "SELL" and current_units < 0):
             return {"blocked": True, "reason": f"Trade already open in same direction for {pair}"}
 
-        # Opposite trade exists: close it first
+        # Opposite direction open -> close first
         close_result = close_trade(existing_trade["id"])
-        print("Closed opposite trade before new entry:", close_result)
+        print("Closed opposite trade first:", close_result)
         time.sleep(1)
 
     units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
@@ -265,7 +294,6 @@ def manage_trades():
                     if not trade_id or not pair:
                         continue
 
-                    # Only start trailing when trade is in profit
                     if unrealized_pl <= 0:
                         continue
 
@@ -331,7 +359,7 @@ def status():
         "session_end_hour": SESSION_END_HOUR,
         "stop_loss_pips": STOP_LOSS_PIPS,
         "take_profit_pips": TAKE_PROFIT_PIPS,
-        "trailing_pips": TRAILING_PIPS,
+        "trailing_pips": TRAILING_PIPS
     })
 
 
