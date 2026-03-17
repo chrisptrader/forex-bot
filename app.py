@@ -10,7 +10,7 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
-ACCOUNT_ID = os.environ.get("ACCOUNT_ID")
+ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
 RISK_PERCENT = 0.02 # 2% risk
