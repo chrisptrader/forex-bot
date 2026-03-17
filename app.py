@@ -1,3 +1,5 @@
+
+
 from flask import Flask, request, jsonify
 import os
 import requests
@@ -14,12 +16,21 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "o.5"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+
+ENABLE_SESSION_FILTER = os.getenv("ENABLE_SESSION_FILTER", "true").lower() == "true"
 SESSION_TIMEZONE = os.getenv("SESSION_TIMEZONE", "America/New_York")
+SESSION_START_HOUR = int(os.getenv("SESSION_START_HOUR", "7"))
+SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "16"))
+
+ENABLE_SPREAD_FILTER = os.getenv("ENABLE_SPREAD_FILTER", "true").lower() == "true"
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 PAIR_MAP = {
     "EURUSD": {
@@ -27,21 +38,24 @@ PAIR_MAP = {
         "sl_distance": 0.0020,
         "tp_distance": 0.0040,
         "pip_value_per_unit": 0.0001,
-        "max_units": 100000
+        "max_units": 100000,
+        "max_spread": 0.00020
     },
     "GBPUSD": {
         "instrument": "GBP_USD",
         "sl_distance": 0.0025,
         "tp_distance": 0.0050,
         "pip_value_per_unit": 0.0001,
-        "max_units": 100000
+        "max_units": 100000,
+        "max_spread": 0.00030
     },
     "XAUUSD": {
         "instrument": "XAU_USD",
         "sl_distance": 10.0,
         "tp_distance": 20.0,
         "pip_value_per_unit": 1.0,
-        "max_units": 100
+        "max_units": 100,
+        "max_spread": 1.00
     }
 }
 
@@ -70,6 +84,24 @@ def reset_daily_state_if_needed():
         STATE["daily_date"] = today
         STATE["daily_start_nav"] = None
         STATE["trades_today"] = 0
+        STATE["last_signal_key"] = None
+        STATE["last_signal_time"] = None
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
 
 
 def oanda_headers():
@@ -99,8 +131,7 @@ def get_account_nav():
     if not account:
         raise Exception(f"OANDA account error: {data}")
 
-    nav = float(account["NAV"])
-    return nav
+    return float(account["NAV"])
 
 
 def get_open_trades():
@@ -117,6 +148,46 @@ def get_open_trades():
 
 def total_open_trades():
     return len(get_open_trades())
+
+
+def pair_has_open_trade(pair):
+    instrument = PAIR_MAP[pair]["instrument"]
+    trades = get_open_trades()
+
+    for trade in trades:
+        if trade.get("instrument") == instrument:
+            return True
+
+    return False
+
+
+def get_pricing(instrument):
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    params = {"instruments": instrument}
+    r = requests.get(url, headers=oanda_headers(), params=params, timeout=20)
+    data = r.json()
+
+    prices = data.get("prices", [])
+    if not prices:
+        raise Exception(f"No pricing found for {instrument}")
+
+    return prices[0]
+
+
+def get_current_spread(pair):
+    instrument = PAIR_MAP[pair]["instrument"]
+    price_data = get_pricing(instrument)
+
+    bids = price_data.get("bids", [])
+    asks = price_data.get("asks", [])
+
+    if not bids or not asks:
+        raise Exception(f"Missing bid/ask for {instrument}")
+
+    bid = float(bids[0]["price"])
+    ask = float(asks[0]["price"])
+
+    return ask - bid, bid, ask
 
 
 def calculate_units(pair, signal):
@@ -145,6 +216,7 @@ def calculate_units(pair, signal):
 
 def duplicate_signal(signal, pair):
     key = f"{signal}:{pair}"
+
     if STATE["last_signal_key"] != key or STATE["last_signal_time"] is None:
         return False
 
@@ -174,6 +246,14 @@ def daily_loss_hit():
     return drawdown_percent >= MAX_DAILY_LOSS_PERCENT, drawdown_percent
 
 
+def session_allowed():
+    if not ENABLE_SESSION_FILTER:
+        return True
+
+    hour = now_local().hour
+    return SESSION_START_HOUR <= hour < SESSION_END_HOUR
+
+
 # =========================
 # ROUTES
 # =========================
@@ -186,8 +266,8 @@ def home():
 def status():
     reset_daily_state_if_needed()
 
-    account_summary = get_account_summary()
     open_trades = get_open_trades()
+    account_summary = get_account_summary()
 
     return jsonify({
         "bot": "running",
@@ -199,6 +279,11 @@ def status():
         "max_trades_per_day": MAX_TRADES_PER_DAY,
         "max_daily_loss_percent": MAX_DAILY_LOSS_PERCENT,
         "cooldown_minutes": COOLDOWN_MINUTES,
+        "enable_session_filter": ENABLE_SESSION_FILTER,
+        "session_timezone": SESSION_TIMEZONE,
+        "session_start_hour": SESSION_START_HOUR,
+        "session_end_hour": SESSION_END_HOUR,
+        "enable_spread_filter": ENABLE_SPREAD_FILTER,
         "supported_pairs": list(PAIR_MAP.keys()),
         "trades_today": STATE["trades_today"],
         "open_trades_count": len(open_trades),
@@ -231,14 +316,28 @@ def webhook():
     if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
         return jsonify({"error": "Missing OANDA credentials"}), 400
 
-    # safety 1: duplicate/cooldown protection
+    # Session filter
+    if not session_allowed():
+        return jsonify({
+            "status": "blocked",
+            "reason": "Outside trading session"
+        }), 200
+
+    # Duplicate / cooldown
     if duplicate_signal(signal, pair):
         return jsonify({
             "status": "blocked",
             "reason": "Duplicate signal / cooldown active"
         }), 200
 
-    # safety 2: max open trades
+    # One trade per pair
+    if pair_has_open_trade(pair):
+        return jsonify({
+            "status": "blocked",
+            "reason": "Trade already open for this pair"
+        }), 200
+
+    # Max open trades
     open_count = total_open_trades()
     if open_count >= MAX_OPEN_TRADES:
         return jsonify({
@@ -247,7 +346,7 @@ def webhook():
             "open_trades_count": open_count
         }), 200
 
-    # safety 3: max trades per day
+    # Max trades per day
     if STATE["trades_today"] >= MAX_TRADES_PER_DAY:
         return jsonify({
             "status": "blocked",
@@ -255,14 +354,37 @@ def webhook():
             "trades_today": STATE["trades_today"]
         }), 200
 
-    # safety 4: daily loss stop
+    # Daily loss stop
     loss_hit, drawdown_percent = daily_loss_hit()
     if loss_hit:
+        send_telegram(f"Bot blocked: daily loss limit hit ({round(drawdown_percent, 2)}%)")
         return jsonify({
             "status": "blocked",
             "reason": "Daily loss limit hit",
             "drawdown_percent": round(drawdown_percent, 2)
         }), 200
+
+    # Spread filter
+    spread = None
+    bid = None
+    ask = None
+    if ENABLE_SPREAD_FILTER:
+        try:
+            spread, bid, ask = get_current_spread(pair)
+            max_spread = PAIR_MAP[pair]["max_spread"]
+
+            if spread > max_spread:
+                return jsonify({
+                    "status": "blocked",
+                    "reason": "Spread too high",
+                    "spread": spread,
+                    "max_spread": max_spread
+                }), 200
+        except Exception as e:
+            return jsonify({
+                "status": "blocked",
+                "reason": f"Spread check failed: {str(e)}"
+            }), 200
 
     pair_info = PAIR_MAP[pair]
     instrument = pair_info["instrument"]
@@ -302,6 +424,21 @@ def webhook():
         STATE["trades_today"] += 1
         remember_signal(signal, pair)
 
+        message = (
+            f"Trade opened\n"
+            f"Pair: {pair}\n"
+            f"Signal: {signal}\n"
+            f"Units: {units}\n"
+            f"Risk: {RISK_PERCENT}%\n"
+            f"SL distance: {sl_distance}\n"
+            f"TP distance: {tp_distance}"
+        )
+
+        if spread is not None:
+            message += f"\nSpread: {spread}"
+
+        send_telegram(message)
+
     return jsonify({
         "status_code": r.status_code,
         "pair": pair,
@@ -310,6 +447,9 @@ def webhook():
         "units": units,
         "stop_loss_distance": sl_distance,
         "take_profit_distance": tp_distance,
+        "spread": spread,
+        "bid": bid,
+        "ask": ask,
         "trades_today": STATE["trades_today"],
         "result": result
     }), r.status_code
