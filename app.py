@@ -9,20 +9,17 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
-ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
+ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
 RISK_PERCENT = 0.02 # 2% risk
-
-# OANDA instrument format
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
-# Trailing stop settings
 ENABLE_TRAILING = True
 
 # =========================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================
 def normalize_pair(pair: str) -> str:
     pair = (pair or "").upper().strip()
@@ -37,12 +34,23 @@ def normalize_pair(pair: str) -> str:
     return mapping.get(pair, pair)
 
 
+def oanda_headers():
+    return {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
 def get_account_balance():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
-    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
+    response = requests.get(url, headers=oanda_headers(), timeout=20)
 
-    response = requests.get(url, headers=headers, timeout=20)
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        raise Exception(f"Could not decode OANDA summary response: {response.text}")
+
+    print("Account summary response:", data)
 
     if response.status_code >= 300:
         raise Exception(f"OANDA account summary error: {data}")
@@ -53,18 +61,17 @@ def get_account_balance():
     return float(data["account"]["balance"])
 
 
-def calculate_units(pair):
+def calculate_units(pair: str) -> int:
     balance = get_account_balance()
     risk_amount = balance * RISK_PERCENT
 
-    # basic test sizing
+    # simple sizing for testing
     if pair == "XAU_USD":
         return max(1, int(risk_amount * 2))
-    else:
-        return max(1, int(risk_amount * 1000))
+    return max(1, int(risk_amount * 1000))
 
 
-def place_trade(signal, pair):
+def place_trade(signal: str, pair: str):
     pair = normalize_pair(pair)
 
     if pair not in PAIRS:
@@ -75,7 +82,7 @@ def place_trade(signal, pair):
     if signal == "SELL":
         units = -units
 
-    data = {
+    order_payload = {
         "order": {
             "units": str(units),
             "instrument": pair,
@@ -86,12 +93,15 @@ def place_trade(signal, pair):
     }
 
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders"
-    headers = {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
-    response = requests.post(url, json=data, headers=headers, timeout=20)
+    print("Placing trade payload:", order_payload)
+
+    response = requests.post(
+        url,
+        json=order_payload,
+        headers=oanda_headers(),
+        timeout=20
+    )
 
     try:
         result = response.json()
@@ -99,34 +109,35 @@ def place_trade(signal, pair):
         result = {"raw_text": response.text}
 
     result["http_status"] = response.status_code
+    print("OANDA order response:", result)
+
     return result
 
 
 def get_open_trades():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
-    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
-
-    response = requests.get(url, headers=headers, timeout=20)
+    response = requests.get(url, headers=oanda_headers(), timeout=20)
 
     try:
         data = response.json()
     except Exception:
+        print("Could not decode open trades response:", response.text)
+        return []
+
+    if response.status_code >= 300:
+        print("Open trades error:", data)
         return []
 
     return data.get("trades", [])
 
 
 # =========================
-# TRAILING STOP MANAGER
+# TRAILING MANAGER
 # =========================
 def manage_trades():
     while True:
         try:
             trades = get_open_trades()
-            headers = {
-                "Authorization": f"Bearer {OANDA_API_KEY}",
-                "Content-Type": "application/json"
-            }
 
             for trade in trades:
                 trade_id = trade.get("id")
@@ -148,7 +159,19 @@ def manage_trades():
                     }
 
                     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
-                    requests.put(url, json=data, headers=headers, timeout=20)
+                    response = requests.put(
+                        url,
+                        json=data,
+                        headers=oanda_headers(),
+                        timeout=20
+                    )
+
+                    try:
+                        trailing_result = response.json()
+                    except Exception:
+                        trailing_result = {"raw_text": response.text}
+
+                    print("Trailing update result:", trailing_result)
 
         except Exception as e:
             print("Error in trailing manager:", e)
@@ -156,7 +179,6 @@ def manage_trades():
         time.sleep(10)
 
 
-# Start background thread
 threading.Thread(target=manage_trades, daemon=True).start()
 
 # =========================
@@ -174,8 +196,8 @@ def status():
         "account_id_set": bool(ACCOUNT_ID),
         "api_key_set": bool(OANDA_API_KEY),
         "base_url": BASE_URL,
-        "risk_percent": RISK_PERCENT,
         "pairs": PAIRS,
+        "risk_percent": RISK_PERCENT,
         "trailing": ENABLE_TRAILING
     })
 
@@ -184,8 +206,13 @@ def status():
 def webhook():
     data = request.get_json(silent=True) or {}
 
+    print("Incoming data:", data)
+
     signal = str(data.get("signal", "")).upper().strip()
     pair = normalize_pair(data.get("pair", ""))
+
+    print("Signal:", signal)
+    print("Pair:", pair)
 
     if signal not in ["BUY", "SELL"]:
         return jsonify({"error": "Invalid signal"}), 400
@@ -196,12 +223,17 @@ def webhook():
     if not OANDA_API_KEY or not ACCOUNT_ID:
         return jsonify({"error": "Missing OANDA credentials"}), 500
 
-    result = place_trade(signal, pair)
-    return jsonify(result), 200
+    try:
+        result = place_trade(signal, pair)
+        print("Trade result:", result)
+        return jsonify(result), 200
+    except Exception as e:
+        print("Webhook execution error:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 
 # =========================
-# RUN APP (RENDER)
+# RUN FOR RENDER
 # =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
