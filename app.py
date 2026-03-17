@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -13,7 +14,10 @@ OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
 ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-RISK_PERCENT = 0.02 # 2% risk
+# Fixed unit size from Render ENV
+OANDA_UNITS = int(os.environ.get("OANDA_UNITS", "10000"))
+
+# These are the OANDA-formatted pairs your bot accepts
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
 ENABLE_TRAILING = True
@@ -41,7 +45,7 @@ def oanda_headers():
     }
 
 
-def get_account_balance():
+def get_account_summary():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
     response = requests.get(url, headers=oanda_headers(), timeout=20)
 
@@ -58,17 +62,24 @@ def get_account_balance():
     if "account" not in data:
         raise Exception(f"Missing 'account' in OANDA response: {data}")
 
-    return float(data["account"]["balance"])
+    return data["account"]
 
 
-def calculate_units(pair: str) -> int:
-    balance = get_account_balance()
-    risk_amount = balance * RISK_PERCENT
+def get_open_trades():
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
+    response = requests.get(url, headers=oanda_headers(), timeout=20)
 
-    # simple sizing for testing
-    if pair == "XAU_USD":
-        return max(1, int(risk_amount * 2))
-    return max(1, int(risk_amount * 1000))
+    try:
+        data = response.json()
+    except Exception:
+        print("Could not decode open trades response:", response.text)
+        return []
+
+    if response.status_code >= 300:
+        print("Open trades error:", data)
+        return []
+
+    return data.get("trades", [])
 
 
 def place_trade(signal: str, pair: str):
@@ -77,8 +88,7 @@ def place_trade(signal: str, pair: str):
     if pair not in PAIRS:
         return {"error": f"Pair not allowed: {pair}"}
 
-    units = calculate_units(pair)
-
+    units = OANDA_UNITS
     if signal == "SELL":
         units = -units
 
@@ -112,23 +122,6 @@ def place_trade(signal: str, pair: str):
     print("OANDA order response:", result)
 
     return result
-
-
-def get_open_trades():
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
-    response = requests.get(url, headers=oanda_headers(), timeout=20)
-
-    try:
-        data = response.json()
-    except Exception:
-        print("Could not decode open trades response:", response.text)
-        return []
-
-    if response.status_code >= 300:
-        print("Open trades error:", data)
-        return []
-
-    return data.get("trades", [])
 
 
 # =========================
@@ -197,7 +190,7 @@ def status():
         "api_key_set": bool(OANDA_API_KEY),
         "base_url": BASE_URL,
         "pairs": PAIRS,
-        "risk_percent": RISK_PERCENT,
+        "units": OANDA_UNITS,
         "trailing": ENABLE_TRAILING
     })
 
