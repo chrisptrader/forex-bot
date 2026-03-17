@@ -19,10 +19,10 @@ BASE_URL = os.environ.get("OANDA_BASE_URL", "https://api-fxpractice.oanda.com/v3
 # Safer default size
 OANDA_UNITS = int(os.environ.get("OANDA_UNITS", "1000"))
 
-# Allowed instruments
+# Allowed pairs
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
-# Trade management
+# Risk / management
 MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", "1"))
 PAIR_COOLDOWN_SECONDS = int(os.environ.get("PAIR_COOLDOWN_SECONDS", "300"))
 
@@ -30,16 +30,16 @@ PAIR_COOLDOWN_SECONDS = int(os.environ.get("PAIR_COOLDOWN_SECONDS", "300"))
 ENABLE_TRAILING = os.environ.get("TRAILING_STOP", "true").lower() == "true"
 TRAILING_PIPS = float(os.environ.get("TRAILING_PIPS", "15"))
 
+# SL / TP
+STOP_LOSS_PIPS = float(os.environ.get("STOP_LOSS_PIPS", "20"))
+TAKE_PROFIT_PIPS = float(os.environ.get("TAKE_PROFIT_PIPS", "40"))
+
 # Session filter
 SESSION_TIMEZONE = os.environ.get("SESSION_TIMEZONE", "America/New_York")
 SESSION_START_HOUR = int(os.environ.get("SESSION_START_HOUR", "7"))
 SESSION_END_HOUR = int(os.environ.get("SESSION_END_HOUR", "17"))
 
-# Risk protection
-STOP_LOSS_PIPS = float(os.environ.get("STOP_LOSS_PIPS", "20"))
-TAKE_PROFIT_PIPS = float(os.environ.get("TAKE_PROFIT_PIPS", "40"))
-
-# Simple memory
+# Memory
 last_trade_time_by_pair = {}
 
 # =========================
@@ -65,9 +65,13 @@ def oanda_headers():
     }
 
 
-def is_session_open():
-    now_local = datetime.now(ZoneInfo(SESSION_TIMEZONE))
-    return SESSION_START_HOUR <= now_local.hour < SESSION_END_HOUR
+def is_session_open() -> bool:
+    try:
+        now_local = datetime.now(ZoneInfo(SESSION_TIMEZONE))
+        return SESSION_START_HOUR <= now_local.hour < SESSION_END_HOUR
+    except Exception as e:
+        print("Session timezone error:", str(e))
+        return True # fail open so timezone issue doesn't kill bot
 
 
 def pip_size(pair: str) -> float:
@@ -80,23 +84,6 @@ def format_price(pair: str, price: float) -> str:
     if pair == "XAU_USD":
         return f"{price:.2f}"
     return f"{price:.5f}"
-
-
-def get_account_summary():
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
-    response = requests.get(url, headers=oanda_headers(), timeout=20)
-
-    try:
-        data = response.json()
-    except Exception:
-        raise Exception(f"Could not decode account summary: {response.text}")
-
-    print("Account summary response:", data)
-
-    if response.status_code >= 300:
-        raise Exception(f"OANDA account summary error: {data}")
-
-    return data.get("account", {})
 
 
 def get_open_trades():
@@ -192,13 +179,14 @@ def close_trade(trade_id: str):
 
 
 def should_trade(signal: str, pair: str):
-    # Starter filter:
-    # trade only during session and only allowed pairs
-    if not is_session_open():
-        return False, "Outside trading session"
-
     if pair not in PAIRS:
         return False, "Pair not allowed"
+
+    if signal not in ["BUY", "SELL"]:
+        return False, "Invalid signal"
+
+    if not is_session_open():
+        return False, "Outside trading session"
 
     return True, "OK"
 
@@ -213,24 +201,23 @@ def place_trade(signal: str, pair: str):
     if should_block_for_cooldown(pair):
         return {"blocked": True, "reason": f"Cooldown active for {pair}"}
 
-    if count_open_trades() >= MAX_OPEN_TRADES:
-        existing_trade = get_open_trade_for_pair(pair)
-
-        if not existing_trade:
-            return {"blocked": True, "reason": "Max open trades reached"}
-
+    total_open = count_open_trades()
     existing_trade = get_open_trade_for_pair(pair)
+
+    if total_open >= MAX_OPEN_TRADES and not existing_trade:
+        return {"blocked": True, "reason": "Max open trades reached"}
 
     if existing_trade:
         current_units = float(existing_trade.get("currentUnits", "0"))
 
         # Same direction already open
         if (signal == "BUY" and current_units > 0) or (signal == "SELL" and current_units < 0):
-            return {"blocked": True, "reason": f"Trade already open in same direction for {pair}"}
+            return {"blocked": True, "reason": f"Same direction trade already open for {pair}"}
 
-        # Opposite direction open -> close first
+        # Opposite trade exists -> close first
+        print("Opposite trade found, closing first:", existing_trade.get("id"))
         close_result = close_trade(existing_trade["id"])
-        print("Closed opposite trade first:", close_result)
+        print("Closed opposite trade result:", close_result)
         time.sleep(1)
 
     units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
@@ -327,7 +314,7 @@ def manage_trades():
                     print("Trailing update result:", trailing_result)
 
         except Exception as e:
-            print("Error in trailing manager:", e)
+            print("Error in trailing manager:", str(e))
 
         time.sleep(20)
 
@@ -352,42 +339,46 @@ def status():
         "pairs": PAIRS,
         "units": OANDA_UNITS,
         "trailing": ENABLE_TRAILING,
+        "trailing_pips": TRAILING_PIPS,
+        "stop_loss_pips": STOP_LOSS_PIPS,
+        "take_profit_pips": TAKE_PROFIT_PIPS,
         "max_open_trades": MAX_OPEN_TRADES,
         "cooldown_seconds": PAIR_COOLDOWN_SECONDS,
         "session_timezone": SESSION_TIMEZONE,
         "session_start_hour": SESSION_START_HOUR,
-        "session_end_hour": SESSION_END_HOUR,
-        "stop_loss_pips": STOP_LOSS_PIPS,
-        "take_profit_pips": TAKE_PROFIT_PIPS,
-        "trailing_pips": TRAILING_PIPS
+        "session_end_hour": SESSION_END_HOUR
     })
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(silent=True) or {}
-
-    print("Incoming data:", data)
-
-    signal = str(data.get("signal", "")).upper().strip()
-    pair = normalize_pair(data.get("pair", ""))
-
-    print("Signal:", signal)
-    print("Pair:", pair)
-
-    if signal not in ["BUY", "SELL"]:
-        return jsonify({"error": "Invalid signal"}), 400
-
-    if pair not in PAIRS:
-        return jsonify({"error": f"Pair not allowed: {pair}"}), 400
-
-    if not OANDA_API_KEY or not ACCOUNT_ID:
-        return jsonify({"error": "Missing OANDA credentials"}), 500
-
     try:
+        data = request.get_json(silent=True)
+
+        print("Raw webhook JSON:", data)
+
+        if not data:
+            return jsonify({"error": "No JSON body received"}), 400
+
+        signal = str(data.get("signal", "")).upper().strip()
+        pair = normalize_pair(data.get("pair", ""))
+
+        print("Parsed signal:", signal)
+        print("Parsed pair:", pair)
+
+        if signal not in ["BUY", "SELL"]:
+            return jsonify({"error": "Invalid signal"}), 400
+
+        if pair not in PAIRS:
+            return jsonify({"error": f"Pair not allowed: {pair}"}), 400
+
+        if not OANDA_API_KEY or not ACCOUNT_ID:
+            return jsonify({"error": "Missing OANDA credentials"}), 500
+
         result = place_trade(signal, pair)
         print("Trade result:", result)
         return jsonify(result), 200
+
     except Exception as e:
         print("Webhook execution error:", str(e))
         return jsonify({"error": str(e)}), 500
