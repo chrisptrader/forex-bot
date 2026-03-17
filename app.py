@@ -14,7 +14,7 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "o.5"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
