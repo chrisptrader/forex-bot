@@ -14,13 +14,11 @@ OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
 ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-# Fixed unit size from Render ENV
 OANDA_UNITS = int(os.environ.get("OANDA_UNITS", "10000"))
-
-# These are the OANDA-formatted pairs your bot accepts
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
 ENABLE_TRAILING = True
+
 
 # =========================
 # HELPERS
@@ -43,26 +41,6 @@ def oanda_headers():
         "Authorization": f"Bearer {OANDA_API_KEY}",
         "Content-Type": "application/json"
     }
-
-
-def get_account_summary():
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
-    response = requests.get(url, headers=oanda_headers(), timeout=20)
-
-    try:
-        data = response.json()
-    except Exception:
-        raise Exception(f"Could not decode OANDA summary response: {response.text}")
-
-    print("Account summary response:", data)
-
-    if response.status_code >= 300:
-        raise Exception(f"OANDA account summary error: {data}")
-
-    if "account" not in data:
-        raise Exception(f"Missing 'account' in OANDA response: {data}")
-
-    return data["account"]
 
 
 def get_open_trades():
@@ -143,7 +121,6 @@ def manage_trades():
                 current_price = float(current_price)
                 unrealized_pl = float(unrealized_pl)
 
-                # very simple trailing logic for testing
                 if ENABLE_TRAILING and unrealized_pl > 0:
                     data = {
                         "stopLoss": {
@@ -173,6 +150,7 @@ def manage_trades():
 
 
 threading.Thread(target=manage_trades, daemon=True).start()
+
 
 # =========================
 # ROUTES
@@ -225,9 +203,6 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 
-# =========================
-# RUN FOR RENDER
-# =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
