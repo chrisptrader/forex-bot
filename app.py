@@ -1,45 +1,26 @@
 from flask import Flask, request, jsonify
 import requests
-import os
 
 app = Flask(__name__)
 
 # =========================
-# CONFIG
+# 🔑 PUT YOUR REAL INFO HERE
 # =========================
-OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
-ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-BASE_URL = os.environ.get("OANDA_BASE_URL", "https://api-fxpractice.oanda.com/v3").strip()
-OANDA_UNITS = int(os.environ.get("OANDA_UNITS", "1000"))
+OANDA_API_KEY = "98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b393622766"
+ACCOUNT_ID = "101-001-37221732-001"
+
+BASE_URL = "https://api-fxpractice.oanda.com/v3"
+UNITS = 1000 # safe size
 
 # =========================
-# HELPERS
+# HELPER
 # =========================
-def normalize_pair(pair: str) -> str:
-    pair = (pair or "").upper().strip()
-    mapping = {
-        "EURUSD": "EUR_USD",
-        "GBPUSD": "GBP_USD",
-        "XAUUSD": "XAU_USD",
-        "EUR_USD": "EUR_USD",
-        "GBP_USD": "GBP_USD",
-        "XAU_USD": "XAU_USD",
-    }
-    return mapping.get(pair, pair)
-
-
-def oanda_headers():
-    return {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-
-def place_trade(signal: str, pair: str):
-    units = OANDA_UNITS if signal == "BUY" else -OANDA_UNITS
+def place_trade(signal, pair):
+    units = UNITS if signal == "BUY" else -UNITS
 
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders"
-    payload = {
+
+    data = {
         "order": {
             "units": str(units),
             "instrument": pair,
@@ -49,78 +30,58 @@ def place_trade(signal: str, pair: str):
         }
     }
 
-    print("Placing trade payload:", payload)
+    headers = {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    response = requests.post(
-        url,
-        json=payload,
-        headers=oanda_headers(),
-        timeout=20
-    )
+    print("🚀 Sending trade:", data)
+
+    response = requests.post(url, json=data, headers=headers)
 
     try:
         result = response.json()
-    except Exception:
-        result = {"raw_text": response.text}
+    except:
+        result = response.text
 
-    print("Trade response:", result)
-    return result, response.status_code
+    print("💰 Trade response:", result)
 
+    return result
 
 # =========================
 # ROUTES
 # =========================
 @app.route("/")
 def home():
-    return "Bot is running 🚀"
-
-
-@app.route("/status")
-def status():
-    return jsonify({
-        "bot": "running",
-        "account_id_set": bool(ACCOUNT_ID),
-        "api_key_set": bool(OANDA_API_KEY),
-        "base_url": BASE_URL,
-        "units": OANDA_UNITS
-    })
-
+    return "Bot is LIVE 🚀"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    try:
-        data = request.get_json(silent=True)
+    data = request.json
 
-        print("Raw webhook JSON:", data)
+    print("Raw webhook JSON:", data)
 
-        if not data:
-            return jsonify({"error": "No JSON body received"}), 400
+    signal = data.get("signal")
+    pair = data.get("pair")
 
-        signal = str(data.get("signal", "")).upper().strip()
-        pair = normalize_pair(data.get("pair", ""))
+    # Fix format
+    if pair == "EURUSD":
+        pair = "EUR_USD"
+    if pair == "GBPUSD":
+        pair = "GBP_USD"
+    if pair == "XAUUSD":
+        pair = "XAU_USD"
 
-        print("Parsed signal:", signal)
-        print("Parsed pair:", pair)
+    print(f"🔥 SIGNAL RECEIVED: {signal} on {pair}")
 
-        if signal not in ["BUY", "SELL"]:
-            return jsonify({"error": "Invalid signal"}), 400
+    result = place_trade(signal, pair)
 
-        if pair not in ["EUR_USD", "GBP_USD", "XAU_USD"]:
-            return jsonify({"error": f"Pair not allowed: {pair}"}), 400
+    return jsonify(result)
 
-        if not OANDA_API_KEY or not ACCOUNT_ID:
-            return jsonify({"error": "Missing OANDA credentials"}), 500
-
-        print(f"🔥 SIGNAL RECEIVED: {signal} on {pair}")
-
-        result, status_code = place_trade(signal, pair)
-        return jsonify(result), status_code
-
-    except Exception as e:
-        print("Webhook execution error:", str(e))
-        return jsonify({"error": str(e)}), 500
-
-
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
+    import os
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
