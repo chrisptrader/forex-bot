@@ -1,22 +1,22 @@
-
-
 from flask import Flask, request, jsonify
 import os
 import requests
 import math
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
 # =========================
-# ENV
+# ENV / SETTINGS
 # =========================
 OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.25"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
@@ -28,6 +28,14 @@ SESSION_START_HOUR = int(os.getenv("SESSION_START_HOUR", "7"))
 SESSION_END_HOUR = int(os.getenv("SESSION_END_HOUR", "16"))
 
 ENABLE_SPREAD_FILTER = os.getenv("ENABLE_SPREAD_FILTER", "true").lower() == "true"
+ALLOW_REVERSE_SIGNAL_CLOSE = os.getenv("ALLOW_REVERSE_SIGNAL_CLOSE", "false").lower() == "true"
+
+ENABLE_TRAILING_STOP = os.getenv("ENABLE_TRAILING_STOP", "true").lower() == "true"
+ENABLE_BACKGROUND_MANAGER = os.getenv("ENABLE_BACKGROUND_MANAGER", "true").lower() == "true"
+MANAGER_INTERVAL_SECONDS = int(os.getenv("MANAGER_INTERVAL_SECONDS", "60"))
+TRAIL_TO_BREAKEVEN_R = float(os.getenv("TRAIL_TO_BREAKEVEN_R", "1.0"))
+TRAIL_LOCK_R = float(os.getenv("TRAIL_LOCK_R", "1.5"))
+TRAIL_LOCK_MULTIPLIER = float(os.getenv("TRAIL_LOCK_MULTIPLIER", "0.5"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -39,7 +47,8 @@ PAIR_MAP = {
         "tp_distance": 0.0040,
         "pip_value_per_unit": 0.0001,
         "max_units": 100000,
-        "max_spread": 0.00020
+        "max_spread": 0.00020,
+        "price_precision": 5
     },
     "GBPUSD": {
         "instrument": "GBP_USD",
@@ -47,7 +56,8 @@ PAIR_MAP = {
         "tp_distance": 0.0050,
         "pip_value_per_unit": 0.0001,
         "max_units": 100000,
-        "max_spread": 0.00030
+        "max_spread": 0.00030,
+        "price_precision": 5
     },
     "XAUUSD": {
         "instrument": "XAU_USD",
@@ -55,7 +65,8 @@ PAIR_MAP = {
         "tp_distance": 20.0,
         "pip_value_per_unit": 1.0,
         "max_units": 100,
-        "max_spread": 1.00
+        "max_spread": 1.00,
+        "price_precision": 2
     }
 }
 
@@ -67,12 +78,13 @@ STATE = {
     "daily_start_nav": None,
     "trades_today": 0,
     "last_signal_key": None,
-    "last_signal_time": None
+    "last_signal_time": None,
+    "manager_started": False
 }
 
 
 # =========================
-# HELPERS
+# BASIC HELPERS
 # =========================
 def now_local():
     return datetime.now(ZoneInfo(SESSION_TIMEZONE))
@@ -93,10 +105,7 @@ def send_telegram(message):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
 
     try:
         requests.post(url, json=payload, timeout=10)
@@ -111,6 +120,16 @@ def oanda_headers():
     }
 
 
+def instrument_to_pair(instrument):
+    for pair, info in PAIR_MAP.items():
+        if info["instrument"] == instrument:
+            return pair
+    return None
+
+
+# =========================
+# OANDA HELPERS
+# =========================
 def get_account_summary():
     if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
         return {"error": "Missing API credentials"}
@@ -127,10 +146,8 @@ def get_account_summary():
 def get_account_nav():
     data = get_account_summary()
     account = data.get("account")
-
     if not account:
         raise Exception(f"OANDA account error: {data}")
-
     return float(account["NAV"])
 
 
@@ -152,21 +169,52 @@ def total_open_trades():
 
 def pair_has_open_trade(pair):
     instrument = PAIR_MAP[pair]["instrument"]
-    trades = get_open_trades()
-
-    for trade in trades:
+    for trade in get_open_trades():
         if trade.get("instrument") == instrument:
             return True
-
     return False
+
+
+def get_trade_details(trade_id):
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}"
+    r = requests.get(url, headers=oanda_headers(), timeout=20)
+    data = r.json()
+    return data.get("trade", {})
+
+
+def close_trade(trade_id):
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
+    r = requests.put(url, headers=oanda_headers(), json={}, timeout=20)
+
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"raw_response": r.text}
+
+
+def replace_trade_stop_loss(trade_id, price):
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders"
+    payload = {
+        "stopLoss": {
+            "price": str(price),
+            "timeInForce": "GTC"
+        }
+    }
+
+    r = requests.put(url, headers=oanda_headers(), json=payload, timeout=20)
+
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"raw_response": r.text}
 
 
 def get_pricing(instrument):
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
     params = {"instruments": instrument}
     r = requests.get(url, headers=oanda_headers(), params=params, timeout=20)
-    data = r.json()
 
+    data = r.json()
     prices = data.get("prices", [])
     if not prices:
         raise Exception(f"No pricing found for {instrument}")
@@ -186,13 +234,16 @@ def get_current_spread(pair):
 
     bid = float(bids[0]["price"])
     ask = float(asks[0]["price"])
+    spread = ask - bid
 
-    return ask - bid, bid, ask
+    return spread, bid, ask
 
 
+# =========================
+# RISK / FILTERS
+# =========================
 def calculate_units(pair, signal):
     pair_info = PAIR_MAP[pair]
-
     nav = get_account_nav()
     risk_amount = nav * (RISK_PERCENT / 100.0)
 
@@ -255,15 +306,126 @@ def session_allowed():
 
 
 # =========================
+# TRAILING STOP MANAGER
+# =========================
+def trailing_stop_manager():
+    if not ENABLE_TRAILING_STOP:
+        return {"status": "disabled"}
+
+    trades = get_open_trades()
+    updates = []
+
+    for trade in trades:
+        try:
+            trade_id = trade.get("id")
+            instrument = trade.get("instrument")
+            pair = instrument_to_pair(instrument)
+
+            if not pair:
+                continue
+
+            pair_info = PAIR_MAP[pair]
+            sl_distance = pair_info["sl_distance"]
+            precision = pair_info["price_precision"]
+
+            current_units = float(trade.get("currentUnits", "0"))
+            if current_units == 0:
+                continue
+
+            side = "BUY" if current_units > 0 else "SELL"
+            entry_price = float(trade.get("price"))
+
+            pricing = get_pricing(instrument)
+            bid = float(pricing["bids"][0]["price"])
+            ask = float(pricing["asks"][0]["price"])
+            current_price = bid if side == "BUY" else ask
+
+            profit_distance = (current_price - entry_price) if side == "BUY" else (entry_price - current_price)
+            current_r = profit_distance / sl_distance if sl_distance > 0 else 0
+
+            trade_details = get_trade_details(trade_id)
+            existing_sl = trade_details.get("stopLossOrder")
+            existing_sl_price = None
+            if existing_sl and existing_sl.get("price"):
+                existing_sl_price = float(existing_sl["price"])
+
+            new_sl_price = None
+
+            # Step 1: move stop to breakeven
+            if current_r >= TRAIL_TO_BREAKEVEN_R:
+                breakeven = entry_price
+                if side == "BUY":
+                    if existing_sl_price is None or existing_sl_price < breakeven:
+                        new_sl_price = breakeven
+                else:
+                    if existing_sl_price is None or existing_sl_price > breakeven:
+                        new_sl_price = breakeven
+
+            # Step 2: lock profit
+            if current_r >= TRAIL_LOCK_R:
+                lock_distance = sl_distance * TRAIL_LOCK_MULTIPLIER
+                lock_price = entry_price + lock_distance if side == "BUY" else entry_price - lock_distance
+
+                if side == "BUY":
+                    if existing_sl_price is None or lock_price > existing_sl_price:
+                        new_sl_price = lock_price
+                else:
+                    if existing_sl_price is None or lock_price < existing_sl_price:
+                        new_sl_price = lock_price
+
+            if new_sl_price is not None:
+                rounded_price = round(new_sl_price, precision)
+                status_code, result = replace_trade_stop_loss(trade_id, rounded_price)
+
+                updates.append({
+                    "trade_id": trade_id,
+                    "pair": pair,
+                    "side": side,
+                    "current_r": round(current_r, 2),
+                    "new_stop_loss": rounded_price,
+                    "status_code": status_code,
+                    "result": result
+                })
+
+        except Exception as e:
+            updates.append({"error": str(e), "trade_id": trade.get("id")})
+
+    return {"status": "ok", "updates": updates}
+
+
+def background_manager_loop():
+    while True:
+        try:
+            trailing_stop_manager()
+        except Exception:
+            pass
+        time.sleep(MANAGER_INTERVAL_SECONDS)
+
+
+def ensure_background_manager():
+    if not ENABLE_BACKGROUND_MANAGER:
+        return
+
+    if STATE["manager_started"]:
+        return
+
+    STATE["manager_started"] = True
+    t = threading.Thread(target=background_manager_loop, daemon=True)
+    t.start()
+
+
+# =========================
 # ROUTES
 # =========================
 @app.route("/", methods=["GET"])
 def home():
+    ensure_background_manager()
     return "Forex bot is running!", 200
 
 
 @app.route("/status", methods=["GET"])
 def status():
+    ensure_background_manager()
     reset_daily_state_if_needed()
 
     open_trades = get_open_trades()
@@ -284,6 +446,13 @@ def status():
         "session_start_hour": SESSION_START_HOUR,
         "session_end_hour": SESSION_END_HOUR,
         "enable_spread_filter": ENABLE_SPREAD_FILTER,
+        "allow_reverse_signal_close": ALLOW_REVERSE_SIGNAL_CLOSE,
+        "enable_trailing_stop": ENABLE_TRAILING_STOP,
+        "enable_background_manager": ENABLE_BACKGROUND_MANAGER,
+        "manager_interval_seconds": MANAGER_INTERVAL_SECONDS,
+        "trail_to_breakeven_r": TRAIL_TO_BREAKEVEN_R,
+        "trail_lock_r": TRAIL_LOCK_R,
+        "trail_lock_multiplier": TRAIL_LOCK_MULTIPLIER,
         "supported_pairs": list(PAIR_MAP.keys()),
         "trades_today": STATE["trades_today"],
         "open_trades_count": len(open_trades),
@@ -292,8 +461,16 @@ def status():
     }), 200
 
 
+@app.route("/manage-trailing", methods=["GET", "POST"])
+def manage_trailing():
+    ensure_background_manager()
+    result = trailing_stop_manager()
+    return jsonify(result), 200
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    ensure_background_manager()
     reset_daily_state_if_needed()
 
     data = request.get_json(silent=True)
@@ -316,28 +493,24 @@ def webhook():
     if not OANDA_ACCOUNT_ID or not OANDA_API_KEY:
         return jsonify({"error": "Missing OANDA credentials"}), 400
 
-    # Session filter
     if not session_allowed():
         return jsonify({
             "status": "blocked",
             "reason": "Outside trading session"
         }), 200
 
-    # Duplicate / cooldown
     if duplicate_signal(signal, pair):
         return jsonify({
             "status": "blocked",
             "reason": "Duplicate signal / cooldown active"
         }), 200
 
-    # One trade per pair
     if pair_has_open_trade(pair):
         return jsonify({
             "status": "blocked",
             "reason": "Trade already open for this pair"
         }), 200
 
-    # Max open trades
     open_count = total_open_trades()
     if open_count >= MAX_OPEN_TRADES:
         return jsonify({
@@ -346,7 +519,6 @@ def webhook():
             "open_trades_count": open_count
         }), 200
 
-    # Max trades per day
     if STATE["trades_today"] >= MAX_TRADES_PER_DAY:
         return jsonify({
             "status": "blocked",
@@ -354,7 +526,6 @@ def webhook():
             "trades_today": STATE["trades_today"]
         }), 200
 
-    # Daily loss stop
     loss_hit, drawdown_percent = daily_loss_hit()
     if loss_hit:
         send_telegram(f"Bot blocked: daily loss limit hit ({round(drawdown_percent, 2)}%)")
@@ -364,10 +535,10 @@ def webhook():
             "drawdown_percent": round(drawdown_percent, 2)
         }), 200
 
-    # Spread filter
     spread = None
     bid = None
     ask = None
+
     if ENABLE_SPREAD_FILTER:
         try:
             spread, bid, ask = get_current_spread(pair)
@@ -456,5 +627,6 @@ def webhook():
 
 
 if __name__ == "__main__":
+    ensure_background_manager()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
