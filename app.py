@@ -7,28 +7,31 @@ import threading
 app = Flask(__name__)
 
 # ================= CONFIG =================
-OANDA_API_KEY = "98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b393622766"
-ACCOUNT_ID = "101-001-37221732-001"
+OANDA_API_KEY = "PASTE_KEY"
+ACCOUNT_ID = "PASTE_ID"
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
+PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD", "USD_JPY"]
 
 STOP_LOSS = {
     "EUR_USD": 20,
     "GBP_USD": 20,
-    "XAU_USD": 200
+    "XAU_USD": 200,
+    "USD_JPY": 20
 }
 
 TAKE_PROFIT = {
     "EUR_USD": 30,
     "GBP_USD": 30,
-    "XAU_USD": 300
+    "XAU_USD": 300,
+    "USD_JPY": 30
 }
 
 BREAK_EVEN = {
     "EUR_USD": 10,
     "GBP_USD": 10,
-    "XAU_USD": 100
+    "XAU_USD": 100,
+    "USD_JPY": 10
 }
 
 COOLDOWN = 300
@@ -48,12 +51,17 @@ def normalize(pair):
     mapping = {
         "EURUSD": "EUR_USD",
         "GBPUSD": "GBP_USD",
-        "XAUUSD": "XAU_USD"
+        "XAUUSD": "XAU_USD",
+        "USDJPY": "USD_JPY"
     }
     return mapping.get(pair)
 
 def pip(pair):
-    return 0.0001 if pair != "XAU_USD" else 0.1
+    if pair == "XAU_USD":
+        return 0.1
+    if pair.endswith("JPY"):
+        return 0.01
+    return 0.0001
 
 def get_price(pair):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
@@ -76,16 +84,14 @@ def get_trade(pair):
 # ================= TRADE =================
 def place_trade(signal, pair):
     if pair not in PAIRS:
-        print("Pair not allowed")
+        print("Pair not allowed:", pair)
         return
 
-    # cooldown
     if pair in last_trade_time:
         if time.time() - last_trade_time[pair] < COOLDOWN:
             print(f"{pair} cooldown active")
             return
 
-    # prevent duplicate trades
     if get_trade(pair):
         print(f"{pair} already has trade — skipping")
         return
@@ -105,14 +111,16 @@ def place_trade(signal, pair):
         tp = entry - tp_pips * pip(pair)
         units = -1000
 
+    price_format = "{:.3f}" if pair.endswith("JPY") else "{:.5f}"
+
     data = {
         "order": {
             "units": str(units),
             "instrument": pair,
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": f"{sl:.5f}"},
-            "takeProfitOnFill": {"price": f"{tp:.5f}"}
+            "stopLossOnFill": {"price": price_format.format(sl)},
+            "takeProfitOnFill": {"price": price_format.format(tp)}
         }
     }
 
@@ -140,15 +148,16 @@ def check_be():
         bid, ask = get_price(pair)
         current = ask if units > 0 else bid
 
-        pips = abs(current - entry) / pip(pair)
-        print(pair, "pips:", pips)
+        pips_profit = abs(current - entry) / pip(pair)
+        print(pair, "pips:", pips_profit)
 
-        if pips >= BREAK_EVEN[pair]:
+        if pips_profit >= BREAK_EVEN.get(pair, 10):
             url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
+            price_format = "{:.3f}" if pair.endswith("JPY") else "{:.5f}"
 
             data = {
                 "stopLoss": {
-                    "price": f"{entry:.5f}"
+                    "price": price_format.format(entry)
                 }
             }
 
