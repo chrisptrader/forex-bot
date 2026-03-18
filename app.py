@@ -2,134 +2,108 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import time
-from datetime import datetime, timezone
+import threading
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
+# ================= CONFIG =================
 OANDA_API_KEY = "98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b393622766"
 ACCOUNT_ID = "101-001-37221732-001"
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-ALLOWED_PAIRS = ["EUR_USD"]
-RISK_PERCENT = 0.75
-MAX_OPEN_TRADES = 1
-COOLDOWN_SECONDS = 300
+PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD"]
 
-STOP_LOSS_PIPS = 20
-TAKE_PROFIT_PIPS = 30
-BREAK_EVEN_PIPS = 10
+STOP_LOSS = {
+    "EUR_USD": 20,
+    "GBP_USD": 20,
+    "XAU_USD": 200
+}
 
-MAX_DAILY_LOSS_PERCENT = 2.0
+TAKE_PROFIT = {
+    "EUR_USD": 30,
+    "GBP_USD": 30,
+    "XAU_USD": 300
+}
+
+BREAK_EVEN = {
+    "EUR_USD": 10,
+    "GBP_USD": 10,
+    "XAU_USD": 100
+}
+
+COOLDOWN = 300
+AUTO_CHECK = 5
 
 last_trade_time = {}
-daily_start_balance = None
-daily_date = None
 
-# =========================
-# HELPERS
-# =========================
-def now_utc_date():
-    return datetime.now(timezone.utc).date().isoformat()
-
-def normalize_pair(pair):
-    return {
-        "EURUSD": "EUR_USD"
-    }.get(pair, pair)
-
-def oanda_headers():
+# ================= HELPERS =================
+def headers():
     return {
         "Authorization": f"Bearer {OANDA_API_KEY}",
         "Content-Type": "application/json"
     }
 
-def pip_size(pair):
-    return 0.0001
+def normalize(pair):
+    pair = pair.upper()
+    mapping = {
+        "EURUSD": "EUR_USD",
+        "GBPUSD": "GBP_USD",
+        "XAUUSD": "XAU_USD"
+    }
+    return mapping.get(pair)
 
-def format_price(pair, price):
-    return f"{price:.5f}"
-
-# =========================
-# OANDA FUNCTIONS
-# =========================
-def get_account():
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/summary"
-    return requests.get(url, headers=oanda_headers()).json()["account"]
-
-def get_open_trades():
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
-    return requests.get(url, headers=oanda_headers()).json().get("trades", [])
+def pip(pair):
+    return 0.0001 if pair != "XAU_USD" else 0.1
 
 def get_price(pair):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
-    data = requests.get(url, headers=oanda_headers()).json()
-    bid = float(data["prices"][0]["bids"][0]["price"])
-    ask = float(data["prices"][0]["asks"][0]["price"])
+    r = requests.get(url, headers=headers()).json()
+    bid = float(r["prices"][0]["bids"][0]["price"])
+    ask = float(r["prices"][0]["asks"][0]["price"])
     return bid, ask
 
-# =========================
-# BREAK EVEN LOGIC
-# =========================
-def move_sl_to_be(trade_id, price):
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
+def get_open_trades():
+    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
+    r = requests.get(url, headers=headers()).json()
+    return r.get("trades", [])
 
-    data = {
-        "stopLoss": {
-            "price": price
-        }
-    }
+def get_trade(pair):
+    for t in get_open_trades():
+        if t["instrument"] == pair:
+            return t
+    return None
 
-    res = requests.put(url, json=data, headers=oanda_headers())
-    print("🔒 BE moved:", res.json())
-
-def check_breakeven():
-    trades = get_open_trades()
-
-    for trade in trades:
-        entry = float(trade["price"])
-        units = float(trade["currentUnits"])
-        trade_id = trade["id"]
-        pair = trade["instrument"]
-
-        bid, ask = get_price(pair)
-        current = ask if units > 0 else bid
-
-        pips = abs(current - entry) / pip_size(pair)
-
-        print("Pips in profit:", pips)
-
-        if pips >= BREAK_EVEN_PIPS:
-            move_sl_to_be(trade_id, format_price(pair, entry))
-
-# =========================
-# RISK + TRADE
-# =========================
+# ================= TRADE =================
 def place_trade(signal, pair):
-    account = get_account()
-    balance = float(account["balance"])
-    risk = balance * (RISK_PERCENT / 100)
+    if pair not in PAIRS:
+        print("Pair not allowed")
+        return
 
-    units = int(risk / 2)
-    units = max(units, 1000)
+    # cooldown
+    if pair in last_trade_time:
+        if time.time() - last_trade_time[pair] < COOLDOWN:
+            print(f"{pair} cooldown active")
+            return
 
-    if signal == "SELL":
-        units *= -1
+    # prevent duplicate trades
+    if get_trade(pair):
+        print(f"{pair} already has trade — skipping")
+        return
 
     bid, ask = get_price(pair)
     entry = ask if signal == "BUY" else bid
 
-    pip = pip_size(pair)
+    sl_pips = STOP_LOSS[pair]
+    tp_pips = TAKE_PROFIT[pair]
 
     if signal == "BUY":
-        sl = entry - STOP_LOSS_PIPS * pip
-        tp = entry + TAKE_PROFIT_PIPS * pip
+        sl = entry - sl_pips * pip(pair)
+        tp = entry + tp_pips * pip(pair)
+        units = 1000
     else:
-        sl = entry + STOP_LOSS_PIPS * pip
-        tp = entry - TAKE_PROFIT_PIPS * pip
-
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders"
+        sl = entry + sl_pips * pip(pair)
+        tp = entry - tp_pips * pip(pair)
+        units = -1000
 
     data = {
         "order": {
@@ -137,42 +111,76 @@ def place_trade(signal, pair):
             "instrument": pair,
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": format_price(pair, sl)},
-            "takeProfitOnFill": {"price": format_price(pair, tp)}
+            "stopLossOnFill": {"price": f"{sl:.5f}"},
+            "takeProfitOnFill": {"price": f"{tp:.5f}"}
         }
     }
 
-    print("🚀 Sending:", data)
+    print(f"🚀 {pair} Sending:", data)
 
-    res = requests.post(url, json=data, headers=oanda_headers())
-    print("💰 Response:", res.json())
+    r = requests.post(
+        f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders",
+        headers=headers(),
+        json=data
+    )
 
-# =========================
-# ROUTES
-# =========================
+    print("💰 Response:", r.json())
+    last_trade_time[pair] = time.time()
+
+# ================= BREAK EVEN =================
+def check_be():
+    trades = get_open_trades()
+
+    for t in trades:
+        pair = t["instrument"]
+        entry = float(t["price"])
+        units = float(t["currentUnits"])
+        trade_id = t["id"]
+
+        bid, ask = get_price(pair)
+        current = ask if units > 0 else bid
+
+        pips = abs(current - entry) / pip(pair)
+        print(pair, "pips:", pips)
+
+        if pips >= BREAK_EVEN[pair]:
+            url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
+
+            data = {
+                "stopLoss": {
+                    "price": f"{entry:.5f}"
+                }
+            }
+
+            requests.put(url, headers=headers(), json=data)
+            print(f"🔒 {pair} moved to BE")
+
+def auto_loop():
+    while True:
+        check_be()
+        time.sleep(AUTO_CHECK)
+
+# ================= ROUTES =================
 @app.route("/")
 def home():
-    return "Bot running with BE 🔥"
+    return "MULTI PAIR BOT LIVE 🚀"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-
     print("Webhook:", data)
 
     signal = data.get("signal")
-    pair = normalize_pair(data.get("pair"))
+    pair = normalize(data.get("pair"))
 
-    place_trade(signal, pair)
-
-    # 👇 THIS IS THE NEW MAGIC
-    check_breakeven()
+    if signal in ["BUY", "SELL"] and pair:
+        place_trade(signal, pair)
 
     return jsonify({"status": "ok"})
 
-# =========================
-# RUN
-# =========================
+# ================= START =================
+threading.Thread(target=auto_loop, daemon=True).start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
