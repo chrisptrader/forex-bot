@@ -7,8 +7,8 @@ import threading
 app = Flask(__name__)
 
 # ================= CONFIG =================
-OANDA_API_KEY = "PASTE_KEY"
-ACCOUNT_ID = "PASTE_ID"
+OANDA_API_KEY = "98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b393622766"
+ACCOUNT_ID = "101-001-37221732-001"
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
 PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD", "USD_JPY"]
