@@ -11,29 +11,27 @@ OANDA_API_KEY = "98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b3936227
 ACCOUNT_ID = "101-001-37221732-001"
 BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-PAIRS = ["EUR_USD", "GBP_USD", "XAU_USD", "USD_JPY"]
+PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY"]
 
 STOP_LOSS = {
     "EUR_USD": 20,
     "GBP_USD": 20,
-    "XAU_USD": 200,
-    "USD_JPY": 20
+    "USD_JPY": 20,
 }
 
 TAKE_PROFIT = {
     "EUR_USD": 30,
     "GBP_USD": 30,
-    "XAU_USD": 300,
-    "USD_JPY": 30
+    "USD_JPY": 30,
 }
 
 BREAK_EVEN = {
     "EUR_USD": 10,
     "GBP_USD": 10,
-    "XAU_USD": 100,
-    "USD_JPY": 10
+    "USD_JPY": 10,
 }
 
+UNITS = 5000
 COOLDOWN = 300
 AUTO_CHECK = 5
 
@@ -47,37 +45,50 @@ def headers():
     }
 
 def normalize(pair):
-    pair = pair.upper()
+    if not pair:
+        return None
+
+    pair = pair.upper().replace("/", "").replace("_", "")
+
     mapping = {
         "EURUSD": "EUR_USD",
         "GBPUSD": "GBP_USD",
-        "XAUUSD": "XAU_USD",
-        "USDJPY": "USD_JPY"
+        "USDJPY": "USD_JPY",
     }
     return mapping.get(pair)
 
 def pip(pair):
-    if pair == "XAU_USD":
-        return 0.1
     if pair.endswith("JPY"):
         return 0.01
     return 0.0001
 
+def price_format(pair, value):
+    if pair.endswith("JPY"):
+        return f"{value:.3f}"
+    return f"{value:.5f}"
+
 def get_price(pair):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
-    r = requests.get(url, headers=headers()).json()
-    bid = float(r["prices"][0]["bids"][0]["price"])
-    ask = float(r["prices"][0]["asks"][0]["price"])
+    r = requests.get(url, headers=headers(), timeout=15)
+    data = r.json()
+
+    prices = data.get("prices", [])
+    if not prices:
+        raise ValueError(f"No price data for {pair}: {data}")
+
+    bid = float(prices[0]["bids"][0]["price"])
+    ask = float(prices[0]["asks"][0]["price"])
     return bid, ask
 
 def get_open_trades():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
-    r = requests.get(url, headers=headers()).json()
-    return r.get("trades", [])
+    r = requests.get(url, headers=headers(), timeout=15)
+    data = r.json()
+    return data.get("trades", [])
 
 def get_trade(pair):
     for t in get_open_trades():
-        if t["instrument"] == pair:
+        if t.get("instrument") == pair:
             return t
     return None
 
@@ -87,13 +98,14 @@ def place_trade(signal, pair):
         print("Pair not allowed:", pair)
         return
 
-    if pair in last_trade_time:
-        if time.time() - last_trade_time[pair] < COOLDOWN:
-            print(f"{pair} cooldown active")
-            return
+    now = time.time()
+    if pair in last_trade_time and now - last_trade_time[pair] < COOLDOWN:
+        print(f"{pair} cooldown active")
+        return
 
-    if get_trade(pair):
-        print(f"{pair} already has trade — skipping")
+    existing_trade = get_trade(pair)
+    if existing_trade:
+        print(f"{pair} already has trade - skipping")
         return
 
     bid, ask = get_price(pair)
@@ -103,76 +115,87 @@ def place_trade(signal, pair):
     tp_pips = TAKE_PROFIT[pair]
 
     if signal == "BUY":
-        sl = entry - sl_pips * pip(pair)
-        tp = entry + tp_pips * pip(pair)
-        units = 1000
+        units = UNITS
+        sl = entry - (sl_pips * pip(pair))
+        tp = entry + (tp_pips * pip(pair))
     else:
-        sl = entry + sl_pips * pip(pair)
-        tp = entry - tp_pips * pip(pair)
-        units = -1000
+        units = -UNITS
+        sl = entry + (sl_pips * pip(pair))
+        tp = entry - (tp_pips * pip(pair))
 
-    price_format = "{:.3f}" if pair.endswith("JPY") else "{:.5f}"
-
-    data = {
+    order = {
         "order": {
             "units": str(units),
             "instrument": pair,
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": price_format.format(sl)},
-            "takeProfitOnFill": {"price": price_format.format(tp)}
+            "timeInForce": "FOK",
+            "stopLossOnFill": {
+                "price": price_format(pair, sl)
+            },
+            "takeProfitOnFill": {
+                "price": price_format(pair, tp)
+            }
         }
     }
 
-    print(f"🚀 {pair} Sending:", data)
+    print(f"🚀 {pair} Sending:", order)
 
     r = requests.post(
         f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders",
         headers=headers(),
-        json=data
+        json=order,
+        timeout=15
     )
 
-    print("💰 Response:", r.json())
-    last_trade_time[pair] = time.time()
+    response_json = r.json()
+    print("🔥 Response:", response_json)
+
+    last_trade_time[pair] = now
 
 # ================= BREAK EVEN =================
 def check_be():
     trades = get_open_trades()
 
     for t in trades:
-        pair = t["instrument"]
+        pair = t.get("instrument")
+        if pair not in BREAK_EVEN:
+            continue
+
         entry = float(t["price"])
         units = float(t["currentUnits"])
         trade_id = t["id"]
 
         bid, ask = get_price(pair)
-        current = ask if units > 0 else bid
+        current = bid if units < 0 else ask
 
         pips_profit = abs(current - entry) / pip(pair)
-        print(pair, "pips:", pips_profit)
+        print(f"{pair} pips in profit: {pips_profit}")
 
-        if pips_profit >= BREAK_EVEN.get(pair, 10):
+        if pips_profit >= BREAK_EVEN[pair]:
             url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
-            price_format = "{:.3f}" if pair.endswith("JPY") else "{:.5f}"
 
             data = {
                 "stopLoss": {
-                    "price": price_format.format(entry)
+                    "price": price_format(pair, entry)
                 }
             }
 
-            requests.put(url, headers=headers(), json=data)
-            print(f"🔒 {pair} moved to BE")
+            r = requests.put(url, headers=headers(), json=data, timeout=15)
+            print(f"🔒 {pair} moved to breakeven:", r.json())
 
 def auto_loop():
     while True:
-        check_be()
+        try:
+            check_be()
+        except Exception as e:
+            print("BE loop error:", str(e))
         time.sleep(AUTO_CHECK)
 
 # ================= ROUTES =================
 @app.route("/")
 def home():
-    return "MULTI PAIR BOT LIVE 🚀"
+    return "FOREX BOT LIVE 🚀"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -183,7 +206,11 @@ def webhook():
     pair = normalize(data.get("pair"))
 
     if signal in ["BUY", "SELL"] and pair:
-        place_trade(signal, pair)
+        try:
+            place_trade(signal, pair)
+        except Exception as e:
+            print("Trade error:", str(e))
+            return jsonify({"status": "error", "message": str(e)}), 500
 
     return jsonify({"status": "ok"})
 
