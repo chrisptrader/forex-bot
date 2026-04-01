@@ -11,8 +11,8 @@ app = Flask(__name__)
 # =========================================================
 # CONFIG
 # =========================================================
-OANDA_API_KEY = os.getenv("98969b4679d01a139e86d66ee8694bef-6f46ee09cb98d79db97096b393622766").strip()
-OANDA_ACCOUNT_ID = os.getenv("101-001-37221732-001").strip()
+OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_ENV = os.getenv("OANDA_ENV", "practice").strip().lower()
 
 if OANDA_ENV == "live":
