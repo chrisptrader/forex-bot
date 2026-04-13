@@ -1,4 +1,3 @@
-
 import os
 import json
 import math
@@ -18,13 +17,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("oanda_runner_v7")
+logger = logging.getLogger("oanda_runner_v8")
 
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-OANDA_API_KEY = os.environ.get("469e15076ceb8166eaf0610b512d93d8-bc1bf817ccfb9f71c8de5540da075b86, "").strip()
-OANDA_ACCOUNT_ID = os.environ.get("001-001-19570066-001", "").strip()
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice").strip().lower()
 
 if OANDA_ENV == "live":
@@ -35,14 +34,14 @@ else:
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
 
 # Risk / trade controls
-DEFAULT_RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "1.0"))
-DEFAULT_UNITS = int(os.environ.get("DEFAULT_UNITS", "1000"))
+DEFAULT_RISK_PERCENT = float(os.environ.get("RISK_PERCENT", "0.25"))
+DEFAULT_UNITS = int(os.environ.get("DEFAULT_UNITS", "100"))
 USE_RISK_SIZING = os.environ.get("USE_RISK_SIZING", "true").lower() == "true"
 
 STOP_LOSS_PIPS = float(os.environ.get("STOP_LOSS_PIPS", "12"))
-BREAK_EVEN_TRIGGER_PIPS = float(os.environ.get("BREAK_EVEN_TRIGGER_PIPS", "12"))
+BREAK_EVEN_TRIGGER_PIPS = float(os.environ.get("BREAK_EVEN_TRIGGER_PIPS", "10"))
 BREAK_EVEN_PLUS_PIPS = float(os.environ.get("BREAK_EVEN_PLUS_PIPS", "0"))
-TRAILING_START_PIPS = float(os.environ.get("TRAILING_START_PIPS", "20"))
+TRAILING_START_PIPS = float(os.environ.get("TRAILING_START_PIPS", "18"))
 TRAILING_DISTANCE_PIPS = float(os.environ.get("TRAILING_DISTANCE_PIPS", "10"))
 
 RUNNER_MODE = os.environ.get("RUNNER_MODE", "true").lower() == "true"
@@ -50,31 +49,30 @@ USE_BACKUP_TP = os.environ.get("USE_BACKUP_TP", "true").lower() == "true"
 BACKUP_TP_PIPS = float(os.environ.get("BACKUP_TP_PIPS", "150"))
 
 MAX_OPEN_TRADES_PER_PAIR = int(os.environ.get("MAX_OPEN_TRADES_PER_PAIR", "2"))
-MAX_OPEN_TRADES_TOTAL = int(os.environ.get("MAX_OPEN_TRADES_TOTAL", "6"))
+MAX_OPEN_TRADES_TOTAL = int(os.environ.get("MAX_OPEN_TRADES_TOTAL", "2"))
 
-MAX_SPREAD_PIPS = float(os.environ.get("MAX_SPREAD_PIPS", "2.0"))
+MAX_SPREAD_PIPS = float(os.environ.get("MAX_SPREAD_PIPS", "1.8"))
 ALLOW_WEEKENDS = os.environ.get("ALLOW_WEEKENDS", "false").lower() == "true"
 
 SESSION_FILTER_ENABLED = os.environ.get("SESSION_FILTER_ENABLED", "true").lower() == "true"
-SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", "7")) # 07:00 UTC
-SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", "20")) # 20:00 UTC
+SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", "7"))
+SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", "17"))
 
 # News filter
 NEWS_FILTER_ENABLED = os.environ.get("NEWS_FILTER_ENABLED", "true").lower() == "true"
-NEWS_BLOCK_BEFORE_MINUTES = int(os.environ.get("NEWS_BLOCK_BEFORE_MINUTES", "30"))
-NEWS_BLOCK_AFTER_MINUTES = int(os.environ.get("NEWS_BLOCK_AFTER_MINUTES", "30"))
-
-# Safer than scraping HTML directly:
-# Option 1: manual windows in ENV
-# NEWS_WINDOWS_JSON = [
-# {"currency":"USD","title":"CPI","time":"2026-04-15T12:30:00Z","impact":"high"},
-# {"currency":"EUR","title":"ECB","time":"2026-04-17T08:00:00Z","impact":"high"}
-# ]
+NEWS_BLOCK_BEFORE_MINUTES = int(os.environ.get("NEWS_BLOCK_BEFORE_MINUTES", "45"))
+NEWS_BLOCK_AFTER_MINUTES = int(os.environ.get("NEWS_BLOCK_AFTER_MINUTES", "45"))
 NEWS_WINDOWS_JSON = os.environ.get("NEWS_WINDOWS_JSON", "").strip()
-
-# Option 2: external JSON feed you control
-# Expected format: [{"currency":"USD","title":"CPI","time":"2026-04-15T12:30:00Z","impact":"high"}]
 NEWS_FEED_URL = os.environ.get("NEWS_FEED_URL", "").strip()
+
+# Trend filter
+TREND_FILTER_ENABLED = os.environ.get("TREND_FILTER_ENABLED", "true").lower() == "true"
+
+# Scale-in settings
+SCALE_IN_ENABLED = os.environ.get("SCALE_IN_ENABLED", "true").lower() == "true"
+SCALE_IN_TRIGGER_PIPS = float(os.environ.get("SCALE_IN_TRIGGER_PIPS", "15"))
+SCALE_IN_RISK_MULTIPLIER = float(os.environ.get("SCALE_IN_RISK_MULTIPLIER", "0.5"))
+MAX_SCALE_INS_PER_PAIR = int(os.environ.get("MAX_SCALE_INS_PER_PAIR", "1"))
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
@@ -130,8 +128,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def normalize_instrument(raw: str) -> str:
-    s = raw.strip().upper()
-    s = s.replace("/", "_")
+    s = raw.strip().upper().replace("/", "_")
     if "_" not in s and len(s) == 6:
         s = f"{s[:3]}_{s[3:]}"
     return s
@@ -143,11 +140,11 @@ def pair_currencies(instrument: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 def pip_size(instrument: str) -> float:
-    base, quote = pair_currencies(instrument)
+    _, quote = pair_currencies(instrument)
     return 0.01 if quote == "JPY" else 0.0001
 
 def price_precision(instrument: str) -> int:
-    base, quote = pair_currencies(instrument)
+    _, quote = pair_currencies(instrument)
     return 3 if quote == "JPY" else 5
 
 def format_price(instrument: str, price: float) -> str:
@@ -240,11 +237,7 @@ def estimate_units_from_risk(
     stop_loss_pips: float,
     account_ccy: str
 ) -> int:
-    if balance <= 0:
-        return 0
-    if risk_percent <= 0:
-        return 0
-    if stop_loss_pips <= 0:
+    if balance <= 0 or risk_percent <= 0 or stop_loss_pips <= 0:
         return 0
 
     risk_amount = balance * (risk_percent / 100.0)
@@ -272,7 +265,6 @@ def session_allowed() -> bool:
     if SESSION_START_UTC <= SESSION_END_UTC:
         return SESSION_START_UTC <= hour < SESSION_END_UTC
 
-    # overnight session, e.g. 22 -> 5
     return hour >= SESSION_START_UTC or hour < SESSION_END_UTC
 
 def spread_allowed(instrument: str) -> Tuple[bool, float]:
@@ -370,6 +362,40 @@ def is_news_blocked(instrument: str) -> Tuple[bool, Optional[dict]]:
     return False, None
 
 # --------------------------------------------------
+# TREND FILTER
+# --------------------------------------------------
+def trend_filter_passed(action: str, payload: dict) -> Tuple[bool, str]:
+    if not TREND_FILTER_ENABLED:
+        return True, "trend filter disabled"
+
+    trend_ok = payload.get("trend_ok", None)
+    trend_direction = str(payload.get("trend_direction", "")).strip().lower()
+
+    if trend_ok is False:
+        return False, "trend_ok=false"
+
+    if trend_direction and trend_direction != action:
+        return False, f"trend direction mismatch ({trend_direction})"
+
+    ema_fast = payload.get("ema_fast")
+    ema_slow = payload.get("ema_slow")
+
+    try:
+        if ema_fast is not None and ema_slow is not None:
+            ema_fast = float(ema_fast)
+            ema_slow = float(ema_slow)
+
+            if action == "buy" and ema_fast <= ema_slow:
+                return False, "ema_fast <= ema_slow for buy"
+
+            if action == "sell" and ema_fast >= ema_slow:
+                return False, "ema_fast >= ema_slow for sell"
+    except Exception:
+        return False, "invalid ema values"
+
+    return True, "trend filter passed"
+
+# --------------------------------------------------
 # ORDER BUILDERS
 # --------------------------------------------------
 def build_market_order_payload(
@@ -436,15 +462,94 @@ def update_trade_stop_loss(trade_id: str, instrument: str, new_sl_price: float) 
     return oanda_put(f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders", payload)
 
 # --------------------------------------------------
+# TRADE STATE HELPERS
+# --------------------------------------------------
+def get_trade_unrealized_pips(trade: dict) -> Tuple[float, float]:
+    instrument = trade["instrument"]
+    px = get_current_price(instrument)
+    pip = pip_size(instrument)
+
+    entry = float(trade["price"])
+    current_units = float(trade["currentUnits"])
+
+    if current_units > 0:
+        current_price = px["bid"]
+        pips_profit = (current_price - entry) / pip
+    else:
+        current_price = px["ask"]
+        pips_profit = (entry - current_price) / pip
+
+    return pips_profit, current_price
+
+def get_existing_stop_loss(trade: dict) -> Optional[float]:
+    slo = trade.get("stopLossOrder")
+    if slo and slo.get("price") is not None:
+        return float(slo["price"])
+    return None
+
+def get_trade_side(trade: dict) -> str:
+    current_units = float(trade["currentUnits"])
+    return "buy" if current_units > 0 else "sell"
+
+def count_profitable_trades_same_direction(instrument: str, side: str, min_pips: float) -> int:
+    count = 0
+    for trade in get_open_trades_for_instrument(instrument):
+        if get_trade_side(trade) != side:
+            continue
+        try:
+            pips_profit, _ = get_trade_unrealized_pips(trade)
+            if pips_profit >= min_pips:
+                count += 1
+        except Exception:
+            continue
+    return count
+
+def count_same_direction_trades(instrument: str, side: str) -> int:
+    count = 0
+    for trade in get_open_trades_for_instrument(instrument):
+        if get_trade_side(trade) == side:
+            count += 1
+    return count
+
+def is_scale_in_allowed(instrument: str, side: str) -> Tuple[bool, str]:
+    if not SCALE_IN_ENABLED:
+        return False, "scale-in disabled"
+
+    same_direction_count = count_same_direction_trades(instrument, side)
+
+    if same_direction_count == 0:
+        return False, "no existing trade to scale into"
+
+    if same_direction_count > MAX_SCALE_INS_PER_PAIR:
+        return False, "max scale-ins reached"
+
+    profitable_count = count_profitable_trades_same_direction(
+        instrument=instrument,
+        side=side,
+        min_pips=SCALE_IN_TRIGGER_PIPS
+    )
+
+    if profitable_count < 1:
+        return False, "existing trade not yet profitable enough"
+
+    return True, "scale-in allowed"
+
+# --------------------------------------------------
 # ORDER PLACEMENT
 # --------------------------------------------------
 def place_trade(
     instrument: str,
     side: str,
+    payload_data: Optional[dict] = None,
     forced_units: Optional[int] = None,
     risk_percent: Optional[float] = None
 ) -> dict:
     instrument = normalize_instrument(instrument)
+    payload_data = payload_data or {}
+
+    trend_ok, trend_reason = trend_filter_passed(side, payload_data)
+    if not trend_ok:
+        return {"status": "blocked", "reason": trend_reason}
 
     if not session_allowed():
         return {"status": "blocked", "reason": "outside allowed session"}
@@ -479,6 +584,14 @@ def place_trade(
     if len(per_pair) >= MAX_OPEN_TRADES_PER_PAIR:
         return {"status": "blocked", "reason": "max open trades reached for pair"}
 
+    same_direction_count = count_same_direction_trades(instrument, side)
+    is_scale_in = same_direction_count >= 1
+
+    if is_scale_in:
+        scale_allowed, scale_reason = is_scale_in_allowed(instrument, side)
+        if not scale_allowed:
+            return {"status": "blocked", "reason": scale_reason}
+
     if forced_units is not None and forced_units > 0:
         units = int(forced_units)
         sizing_mode = "forced_units"
@@ -486,6 +599,10 @@ def place_trade(
         balance = get_account_balance()
         acct_ccy = get_account_currency()
         rpct = DEFAULT_RISK_PERCENT if risk_percent is None else float(risk_percent)
+
+        if is_scale_in:
+            rpct = rpct * SCALE_IN_RISK_MULTIPLIER
+
         units = estimate_units_from_risk(
             instrument=instrument,
             balance=balance,
@@ -493,15 +610,17 @@ def place_trade(
             stop_loss_pips=STOP_LOSS_PIPS,
             account_ccy=acct_ccy
         )
-        sizing_mode = "risk_percent"
+        sizing_mode = "risk_percent_scale_in" if is_scale_in else "risk_percent"
     else:
         units = DEFAULT_UNITS
+        if is_scale_in:
+            units = max(1, int(math.floor(units * SCALE_IN_RISK_MULTIPLIER)))
         sizing_mode = "default_units"
 
     if units <= 0:
         return {"status": "blocked", "reason": "calculated units <= 0"}
 
-    payload = build_market_order_payload(
+    order_payload = build_market_order_payload(
         instrument=instrument,
         side=side,
         units=units,
@@ -511,44 +630,23 @@ def place_trade(
         backup_tp_pips=BACKUP_TP_PIPS
     )
 
-    response = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
+    response = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", order_payload)
 
     return {
         "status": "ok",
         "instrument": instrument,
         "side": side,
         "units": units,
-        "sizing_mode": sizing_mode,
         "spread_pips": round(spread, 2),
+        "trend_reason": trend_reason,
+        "sizing_mode": sizing_mode,
+        "is_scale_in": is_scale_in,
         "response": response
     }
 
 # --------------------------------------------------
 # TRADE MANAGEMENT
 # --------------------------------------------------
-def get_trade_unrealized_pips(trade: dict) -> Tuple[float, float]:
-    instrument = trade["instrument"]
-    px = get_current_price(instrument)
-    pip = pip_size(instrument)
-
-    entry = float(trade["price"])
-    current_units = float(trade["currentUnits"])
-
-    if current_units > 0:
-        current_price = px["bid"]
-        pips_profit = (current_price - entry) / pip
-    else:
-        current_price = px["ask"]
-        pips_profit = (entry - current_price) / pip
-
-    return pips_profit, current_price
-
-def get_existing_stop_loss(trade: dict) -> Optional[float]:
-    slo = trade.get("stopLossOrder")
-    if slo and slo.get("price") is not None:
-        return float(slo["price"])
-    return None
-
 def manage_open_trades() -> dict:
     trades = get_open_trades()
     results = []
@@ -565,7 +663,6 @@ def manage_open_trades() -> dict:
             pips_profit, current_price = get_trade_unrealized_pips(trade)
             action_taken = "none"
 
-            # BUY
             if current_units > 0:
                 if pips_profit >= BREAK_EVEN_TRIGGER_PIPS:
                     be_price = entry + (BREAK_EVEN_PLUS_PIPS * pip)
@@ -581,7 +678,6 @@ def manage_open_trades() -> dict:
                         existing_sl = new_sl
                         action_taken = f"trail_to_{format_price(instrument, new_sl)}"
 
-            # SELL
             elif current_units < 0:
                 if pips_profit >= BREAK_EVEN_TRIGGER_PIPS:
                     be_price = entry - (BREAK_EVEN_PLUS_PIPS * pip)
@@ -626,7 +722,7 @@ def manage_open_trades() -> dict:
 def home():
     return jsonify({
         "status": "running",
-        "bot": "OANDA Runner V7",
+        "bot": "OANDA Runner V8",
         "env": OANDA_ENV
     })
 
@@ -643,7 +739,8 @@ def health():
             "currency": account.get("currency"),
             "session_allowed": session_allowed(),
             "news_filter_enabled": NEWS_FILTER_ENABLED,
-            "session_filter_enabled": SESSION_FILTER_ENABLED
+            "trend_filter_enabled": TREND_FILTER_ENABLED,
+            "scale_in_enabled": SCALE_IN_ENABLED
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
@@ -689,6 +786,7 @@ def webhook():
             result = place_trade(
                 instrument=instrument,
                 side="buy",
+                payload_data=data,
                 forced_units=units,
                 risk_percent=risk_percent
             )
@@ -698,6 +796,7 @@ def webhook():
             result = place_trade(
                 instrument=instrument,
                 side="sell",
+                payload_data=data,
                 forced_units=units,
                 risk_percent=risk_percent
             )
@@ -731,3 +830,4 @@ if __name__ == "__main__":
     validate_env()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
