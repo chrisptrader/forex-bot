@@ -1,14 +1,16 @@
 from flask import Flask, request, jsonify
 import os
 import time
+import json
 import threading
+import datetime
 import requests
 
 app = Flask(__name__)
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice").strip().lower()
@@ -18,46 +20,66 @@ if OANDA_ENV == "live":
 else:
     BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
+# Active pairs for this V8
 PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"]
 
+# Safer starting size
 UNITS = int(os.environ.get("UNITS", "3000"))
 
+# Timeframe used for filters
+GRANULARITY = os.environ.get("GRANULARITY", "M5").strip().upper()
+
+# Risk / trade management
 STOP_LOSS = {
     "EUR_USD": 12,
     "GBP_USD": 12,
     "USD_JPY": 12,
-    "XAU_USD": 200,
+    "XAU_USD": 250,
 }
 
 TAKE_PROFIT = {
-    "EUR_USD": 18,
-    "GBP_USD": 18,
+    "EUR_USD": 20,
+    "GBP_USD": 20,
     "USD_JPY": 18,
-    "XAU_USD": 300,
+    "XAU_USD": 400,
 }
 
 BREAK_EVEN = {
     "EUR_USD": 8,
     "GBP_USD": 8,
-    "USD_JPY": 8,
-    "XAU_USD": 120,
+    "USD_JPY": 7,
+    "XAU_USD": 180,
 }
 
 MAX_SPREAD = {
     "EUR_USD": 0.00025,
     "GBP_USD": 0.00035,
     "USD_JPY": 0.025,
-    "XAU_USD": 0.80,
+    "XAU_USD": 1.20,
 }
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "900"))
 AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
+MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
+
+# Session filter in UTC
+LONDON_START = 7
+NEW_YORK_END = 20
+
+# Trend filter settings
+FAST_EMA = 50
+SLOW_EMA = 200
+CANDLE_COUNT = 220
 
 last_trade_time = {}
 
-# =========================
+# =========================================================
 # HELPERS
-# =========================
+# =========================================================
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def headers() -> dict:
     return {
         "Authorization": f"Bearer {OANDA_API_KEY}",
@@ -65,15 +87,12 @@ def headers() -> dict:
     }
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
 def normalize_pair(pair: str | None) -> str | None:
     if not pair:
         return None
-    p = pair.strip().upper().replace("/", "_")
-    aliases = {
+
+    p = str(pair).strip().upper().replace("/", "_")
+    mapping = {
         "EURUSD": "EUR_USD",
         "GBPUSD": "GBP_USD",
         "USDJPY": "USD_JPY",
@@ -83,7 +102,14 @@ def normalize_pair(pair: str | None) -> str | None:
         "USD_JPY": "USD_JPY",
         "XAU_USD": "XAU_USD",
     }
-    return aliases.get(p)
+    return mapping.get(p)
+
+
+def normalize_signal(signal: str | None) -> str | None:
+    if not signal:
+        return None
+    s = str(signal).strip().upper()
+    return s if s in {"BUY", "SELL"} else None
 
 
 def pip_size(pair: str) -> float:
@@ -102,6 +128,27 @@ def price_format(pair: str, price: float) -> str:
     return f"{price:.5f}"
 
 
+def ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+    ema_value = sum(values[:period]) / period
+
+    for price in values[period:]:
+        ema_value = (price - ema_value) * multiplier + ema_value
+
+    return ema_value
+
+
+def in_session() -> bool:
+    hour = datetime.datetime.utcnow().hour
+    return LONDON_START <= hour <= NEW_YORK_END
+
+
+# =========================================================
+# OANDA API
+# =========================================================
 def oanda_get(endpoint: str) -> dict:
     url = f"{BASE_URL}{endpoint}"
     r = requests.get(url, headers=headers(), timeout=20)
@@ -126,13 +173,15 @@ def oanda_put(endpoint: str, payload: dict) -> dict:
 def get_pricing(instruments: list[str]) -> dict[str, dict]:
     joined = ",".join(instruments)
     data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/pricing?instruments={joined}")
-    prices = {}
+    out = {}
+
     for item in data.get("prices", []):
         instrument = item["instrument"]
         bid = float(item["bids"][0]["price"])
         ask = float(item["asks"][0]["price"])
-        prices[instrument] = {"bid": bid, "ask": ask}
-    return prices
+        out[instrument] = {"bid": bid, "ask": ask}
+
+    return out
 
 
 def get_current_price(pair: str) -> dict:
@@ -149,8 +198,7 @@ def get_spread(pair: str) -> float:
 
 def spread_allowed(pair: str) -> tuple[bool, float]:
     spread = get_spread(pair)
-    allowed = spread <= MAX_SPREAD[pair]
-    return allowed, spread
+    return spread <= MAX_SPREAD[pair], spread
 
 
 def get_open_trades() -> list[dict]:
@@ -165,37 +213,156 @@ def get_open_trade_for_pair(pair: str) -> dict | None:
     return None
 
 
+def get_candles(pair: str, count: int = CANDLE_COUNT, granularity: str = GRANULARITY) -> list[dict]:
+    data = oanda_get(
+        f"/instruments/{pair}/candles?price=M&granularity={granularity}&count={count}"
+    )
+    return data.get("candles", [])
+
+
+# =========================================================
+# STRATEGY FILTERS
+# =========================================================
+def candle_closes(pair: str) -> list[float]:
+    candles = get_candles(pair)
+    closes = []
+
+    for c in candles:
+        if c.get("complete"):
+            closes.append(float(c["mid"]["c"]))
+
+    return closes
+
+
+def last_two_complete_candles(pair: str) -> tuple[dict | None, dict | None]:
+    candles = get_candles(pair)
+    complete = [c for c in candles if c.get("complete")]
+
+    if len(complete) < 2:
+        return None, None
+
+    return complete[-2], complete[-1]
+
+
+def trend_ok(signal: str, pair: str) -> tuple[bool, str]:
+    closes = candle_closes(pair)
+
+    if len(closes) < SLOW_EMA + 5:
+        return False, "not enough candles"
+
+    fast = ema(closes, FAST_EMA)
+    slow = ema(closes, SLOW_EMA)
+    last_close = closes[-1]
+
+    if fast is None or slow is None:
+        return False, "ema unavailable"
+
+    # Direction filter
+    if signal == "BUY":
+        if not (last_close > fast > slow):
+            return False, f"trend blocked buy last={last_close} fast={fast} slow={slow}"
+    else:
+        if not (last_close < fast < slow):
+            return False, f"trend blocked sell last={last_close} fast={fast} slow={slow}"
+
+    # Momentum confirmation: last closed candle direction
+    prev_candle, last_candle = last_two_complete_candles(pair)
+    if not prev_candle or not last_candle:
+        return False, "candle confirmation unavailable"
+
+    o = float(last_candle["mid"]["o"])
+    c = float(last_candle["mid"]["c"])
+
+    if signal == "BUY" and c <= o:
+        return False, "last candle not bullish"
+    if signal == "SELL" and c >= o:
+        return False, "last candle not bearish"
+
+    return True, "trend ok"
+
+
 def cooldown_active(pair: str) -> bool:
     last = last_trade_time.get(pair, 0)
     return (time.time() - last) < COOLDOWN_SECONDS
 
 
-# =========================
-# TRADE LOGIC
-# =========================
-def place_trade(signal: str, pair: str) -> None:
-    signal = signal.upper().strip()
+def open_trade_slots_available() -> bool:
+    return len(get_open_trades()) < MAX_TOTAL_OPEN_TRADES
 
-    if signal not in {"BUY", "SELL"}:
-        log(f"Invalid signal: {signal}")
-        return
+
+# =========================================================
+# WEBHOOK PARSING
+# =========================================================
+def parse_webhook_payload() -> dict:
+    # 1) direct JSON object
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+
+    # 2) raw body
+    raw = request.get_data(as_text=True).strip()
+
+    if not raw:
+        raise ValueError("empty payload")
+
+    # 3) normal JSON object in string body
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+
+        # 4) JSON string containing JSON
+        if isinstance(parsed, str):
+            parsed2 = json.loads(parsed)
+            if isinstance(parsed2, dict):
+                return parsed2
+    except Exception:
+        pass
+
+    # 5) manual cleanup for weird wrapped strings
+    cleaned = raw.strip().strip('"').replace('\\"', '"')
+    parsed = json.loads(cleaned)
+    if isinstance(parsed, dict):
+        return parsed
+
+    raise ValueError("invalid payload format")
+
+
+# =========================================================
+# TRADE LOGIC
+# =========================================================
+def place_trade(signal: str, pair: str) -> dict:
+    signal = normalize_signal(signal)
+    pair = normalize_pair(pair)
+
+    if signal is None:
+        return {"status": "skipped", "reason": "invalid signal"}
+
+    if pair is None:
+        return {"status": "skipped", "reason": "invalid pair"}
 
     if pair not in PAIRS:
-        log(f"Pair not allowed: {pair}")
-        return
+        return {"status": "skipped", "reason": f"pair not enabled: {pair}"}
+
+    if not in_session():
+        return {"status": "skipped", "reason": "outside session"}
+
+    if not open_trade_slots_available():
+        return {"status": "skipped", "reason": "max total open trades reached"}
 
     if get_open_trade_for_pair(pair):
-        log(f"{pair} already has trade - skipping")
-        return
+        return {"status": "skipped", "reason": f"{pair} already has open trade"}
 
     if cooldown_active(pair):
-        log(f"{pair} cooldown active - skipping")
-        return
+        return {"status": "skipped", "reason": f"{pair} cooldown active"}
 
     spread_ok, spread = spread_allowed(pair)
     if not spread_ok:
-        log(f"{pair} spread too high: {spread}")
-        return
+        return {"status": "skipped", "reason": f"{pair} spread too high: {spread}"}
+
+    trend_pass, trend_reason = trend_ok(signal, pair)
+    if not trend_pass:
+        return {"status": "skipped", "reason": trend_reason}
 
     px = get_current_price(pair)
     bid = px["bid"]
@@ -227,21 +394,24 @@ def place_trade(signal: str, pair: str) -> None:
             },
             "takeProfitOnFill": {
                 "price": price_format(pair, tp_price)
-            },
+            }
         }
     }
 
-    log(f"Webhook: {{'signal': '{signal}', 'pair': '{pair}'}}")
+    log(f"Webhook accepted: signal={signal} pair={pair}")
     log(f"{pair} Sending: {order}")
 
-    try:
-        response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", order)
-        log(f"{pair} Response: {response}")
-        last_trade_time[pair] = time.time()
-    except Exception as e:
-        log(f"{pair} order failed: {e}")
+    response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", order)
+    log(f"{pair} Response: {response}")
+
+    last_trade_time[pair] = time.time()
+
+    return {"status": "placed", "pair": pair, "signal": signal, "response": response}
 
 
+# =========================================================
+# TRADE MANAGEMENT
+# =========================================================
 def check_breakeven() -> None:
     trades = get_open_trades()
     if not trades:
@@ -258,8 +428,8 @@ def check_breakeven() -> None:
             trade_id = trade["id"]
             entry = float(trade["price"])
             units = float(trade["currentUnits"])
-            px = prices.get(pair)
 
+            px = prices.get(pair)
             if not px:
                 continue
 
@@ -275,11 +445,13 @@ def check_breakeven() -> None:
                         "price": price_format(pair, entry)
                     }
                 }
+
                 response = oanda_put(
                     f"/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
                     payload,
                 )
                 log(f"🔥 {pair} moved to breakeven: {response}")
+
         except Exception as e:
             log(f"BE error on trade: {e}")
 
@@ -290,43 +462,47 @@ def auto_loop() -> None:
             check_breakeven()
         except Exception as e:
             log(f"BE loop error: {e}")
+
         time.sleep(AUTO_CHECK_SECONDS)
 
 
-# =========================
+# =========================================================
 # ROUTES
-# =========================
+# =========================================================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "bot": "OANDA Runner V8",
+        "bot": "OANDA Runner Real V8",
         "env": OANDA_ENV,
-        "status": "running",
         "pairs": PAIRS,
+        "status": "running",
         "units": UNITS,
+        "granularity": GRANULARITY,
+        "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
     })
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        signal = str(data.get("signal", "")).upper().strip()
-        pair = normalize_pair(data.get("pair"))
+        data = parse_webhook_payload()
 
-        if signal not in {"BUY", "SELL"} or not pair:
-            return jsonify({"status": "error", "message": "invalid signal or pair"}), 400
+        signal = data.get("signal")
+        pair = data.get("pair")
 
-        place_trade(signal, pair)
-        return jsonify({"status": "ok", "signal": signal, "pair": pair})
+        result = place_trade(signal, pair)
+
+        code = 200 if result["status"] in {"placed", "skipped"} else 400
+        return jsonify(result), code
+
     except Exception as e:
         log(f"Webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 
-# =========================
+# =========================================================
 # START
-# =========================
+# =========================================================
 threading.Thread(target=auto_loop, daemon=True).start()
 
 if __name__ == "__main__":
