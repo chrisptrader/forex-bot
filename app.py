@@ -25,9 +25,10 @@ UNITS = int(os.environ.get("UNITS", "3000"))
 AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
 MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
 
-# V9 trend settings
+# Trend + momentum
 EMA_PERIOD = int(os.environ.get("EMA_PERIOD", "20"))
 TREND_GRANULARITY = os.environ.get("TREND_GRANULARITY", "M5").strip().upper()
+MOMENTUM_LOOKBACK = int(os.environ.get("MOMENTUM_LOOKBACK", "3"))
 
 STOP_LOSS = {
     "EUR_USD": 12,
@@ -124,13 +125,10 @@ def price_format(pair: str, price: float) -> str:
 def ema(values: list[float], period: int) -> float:
     if len(values) < period:
         raise ValueError(f"Need at least {period} values for EMA")
-
     k = 2 / (period + 1)
     current_ema = sum(values[:period]) / period
-
     for v in values[period:]:
         current_ema = (v * k) + (current_ema * (1 - k))
-
     return current_ema
 
 
@@ -162,13 +160,11 @@ def get_pricing(instruments: list[str]) -> dict[str, dict]:
     joined = ",".join(instruments)
     data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/pricing?instruments={joined}")
     out = {}
-
     for item in data.get("prices", []):
         instrument = item["instrument"]
         bid = float(item["bids"][0]["price"])
         ask = float(item["asks"][0]["price"])
         out[instrument] = {"bid": bid, "ask": ask}
-
     return out
 
 
@@ -195,26 +191,35 @@ def open_trade_slots_available() -> bool:
     return len(get_open_trades()) < MAX_TOTAL_OPEN_TRADES
 
 
-def get_candles(pair: str, granularity: str = "M5", count: int = 50) -> list[float]:
+def get_candles_raw(pair: str, granularity: str = "M5", count: int = 60) -> list[dict]:
     endpoint = (
         f"/instruments/{pair}/candles"
         f"?price=M&granularity={granularity}&count={count}"
     )
     data = oanda_get(endpoint)
-    closes = []
-
+    candles = []
     for candle in data.get("candles", []):
         if candle.get("complete"):
-            closes.append(float(candle["mid"]["c"]))
-
-    return closes
+            candles.append({
+                "o": float(candle["mid"]["o"]),
+                "h": float(candle["mid"]["h"]),
+                "l": float(candle["mid"]["l"]),
+                "c": float(candle["mid"]["c"]),
+                "time": candle.get("time"),
+            })
+    return candles
 
 
 # =========================================================
-# V9 TREND FILTER
+# V10 FILTERS
 # =========================================================
 def trend_allowed(pair: str, signal: str) -> tuple[bool, dict]:
-    closes = get_candles(pair, granularity=TREND_GRANULARITY, count=max(EMA_PERIOD + 10, 40))
+    candles = get_candles_raw(
+        pair,
+        granularity=TREND_GRANULARITY,
+        count=max(EMA_PERIOD + 15, 50),
+    )
+    closes = [c["c"] for c in candles]
 
     if len(closes) < EMA_PERIOD:
         return False, {"reason": "not enough candle data"}
@@ -236,6 +241,45 @@ def trend_allowed(pair: str, signal: str) -> tuple[bool, dict]:
     else:
         allowed = last_close < current_ema
 
+    return allowed, info
+
+
+def momentum_allowed(pair: str, signal: str) -> tuple[bool, dict]:
+    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(MOMENTUM_LOOKBACK + 3, 8))
+    if len(candles) < MOMENTUM_LOOKBACK:
+        return False, {"reason": "not enough momentum candles"}
+
+    recent = candles[-MOMENTUM_LOOKBACK:]
+    bodies = [abs(c["c"] - c["o"]) for c in recent]
+    total_body = sum(bodies)
+    last = recent[-1]
+    last_body = abs(last["c"] - last["o"])
+    candle_range = max(last["h"] - last["l"], 1e-9)
+
+    bullish_count = sum(1 for c in recent if c["c"] > c["o"])
+    bearish_count = sum(1 for c in recent if c["c"] < c["o"])
+
+    info = {
+        "pair": pair,
+        "signal": signal,
+        "lookback": MOMENTUM_LOOKBACK,
+        "last_open": round(last["o"], 6),
+        "last_close": round(last["c"], 6),
+        "last_body": round(last_body, 6),
+        "last_range": round(candle_range, 6),
+        "bullish_count": bullish_count,
+        "bearish_count": bearish_count,
+    }
+
+    # Strong directional candle with decent body relative to range
+    body_ratio_ok = (last_body / candle_range) >= 0.45
+
+    if signal == "BUY":
+        direction_ok = last["c"] > last["o"] and bullish_count >= 2
+    else:
+        direction_ok = last["c"] < last["o"] and bearish_count >= 2
+
+    allowed = direction_ok and body_ratio_ok
     return allowed, info
 
 
@@ -290,10 +334,10 @@ def place_trade(signal: str, pair: str) -> dict:
         return {"status": "skipped", "reason": "trade already open"}
 
     try:
-        allowed, trend_info = trend_allowed(pair, signal)
+        trend_ok, trend_info = trend_allowed(pair, signal)
         log(f"TREND CHECK: {trend_info}")
 
-        if not allowed:
+        if not trend_ok:
             log(f"SKIPPED {pair} {signal}: trend filter blocked")
             return {
                 "status": "skipped",
@@ -301,10 +345,21 @@ def place_trade(signal: str, pair: str) -> dict:
                 "trend": trend_info,
             }
 
+        momentum_ok, momentum_info = momentum_allowed(pair, signal)
+        log(f"MOMENTUM CHECK: {momentum_info}")
+
+        if not momentum_ok:
+            log(f"SKIPPED {pair} {signal}: momentum filter blocked")
+            return {
+                "status": "skipped",
+                "reason": "momentum filter blocked",
+                "trend": trend_info,
+                "momentum": momentum_info,
+            }
+
         px = get_current_price(pair)
         bid = px["bid"]
         ask = px["ask"]
-
         entry = ask if signal == "BUY" else bid
 
         pip = pip_size(pair)
@@ -336,11 +391,10 @@ def place_trade(signal: str, pair: str) -> dict:
             }
         }
 
-        log(f"FAST EXECUTION: {signal} {pair}")
+        log(f"SNIPER EXECUTION: {signal} {pair}")
         log(f"{pair} sending order: {payload}")
 
         response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-
         last_trade_time[pair] = time.time()
 
         log(f"{pair} trade placed")
@@ -351,6 +405,7 @@ def place_trade(signal: str, pair: str) -> dict:
             "pair": pair,
             "signal": signal,
             "trend": trend_info,
+            "momentum": momentum_info,
             "response": response,
         }
 
@@ -380,9 +435,13 @@ def manage_open_trades() -> None:
             if not px:
                 continue
 
-            current = px["bid"] if units > 0 else px["ask"]
-            pip = pip_size(pair)
-            pips_profit = abs(current - entry) / pip
+            # Signed pips profit
+            if units > 0:
+                current = px["bid"]
+                pips_profit = (current - entry) / pip_size(pair)
+            else:
+                current = px["ask"]
+                pips_profit = (entry - current) / pip_size(pair)
 
             log(f"{pair} pips in profit: {pips_profit}")
 
@@ -401,6 +460,8 @@ def manage_open_trades() -> None:
                 log(f"{pair} moved to breakeven: {response}")
 
             if pips_profit >= TRAIL_AFTER[pair]:
+                pip = pip_size(pair)
+
                 if units > 0:
                     new_sl = current - (TRAIL_LOCK[pair] * pip)
                 else:
@@ -438,10 +499,11 @@ def auto_loop() -> None:
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "bot": "OANDA Runner V9",
+        "bot": "OANDA Runner V10 Sniper",
         "env": OANDA_ENV,
         "trend_granularity": TREND_GRANULARITY,
         "ema_period": EMA_PERIOD,
+        "momentum_lookback": MOMENTUM_LOOKBACK,
         "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
         "pairs": PAIRS,
         "status": "running",
