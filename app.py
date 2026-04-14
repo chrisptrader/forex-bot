@@ -3,7 +3,6 @@ import os
 import time
 import json
 import threading
-import datetime as dt
 import requests
 
 app = Flask(__name__)
@@ -23,14 +22,8 @@ else:
 PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"]
 
 UNITS = int(os.environ.get("UNITS", "3000"))
-ENTRY_GRANULARITY = os.environ.get("GRANULARITY", "M5").strip().upper()
-
 AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "30"))
 MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
-
-SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", "7"))
-SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", "20"))
 
 STOP_LOSS = {
     "EUR_USD": 12,
@@ -67,17 +60,6 @@ TRAIL_LOCK = {
     "XAU_USD": 120,
 }
 
-MAX_SPREAD = {
-    "EUR_USD": 0.00030,
-    "GBP_USD": 0.00045,
-    "USD_JPY": 0.035,
-    "XAU_USD": 1.80,
-}
-
-FAST_EMA = 20
-MID_EMA = 50
-CANDLE_COUNT = 120
-
 last_trade_time = {}
 managed_to_be = set()
 
@@ -86,10 +68,6 @@ managed_to_be = set()
 # =========================================================
 def log(message: str) -> None:
     print(message, flush=True)
-
-
-def utc_now() -> dt.datetime:
-    return dt.datetime.utcnow()
 
 
 def headers() -> dict:
@@ -139,27 +117,6 @@ def price_format(pair: str, price: float) -> str:
     return f"{price:.5f}"
 
 
-def ema(values: list[float], period: int) -> float | None:
-    if len(values) < period:
-        return None
-
-    mult = 2 / (period + 1)
-    value = sum(values[:period]) / period
-    for v in values[period:]:
-        value = ((v - value) * mult) + value
-    return value
-
-
-def in_session() -> bool:
-    hour = utc_now().hour
-    return SESSION_START_UTC <= hour <= SESSION_END_UTC
-
-
-def cooldown_active(pair: str) -> bool:
-    last = last_trade_time.get(pair, 0)
-    return (time.time() - last) < COOLDOWN_SECONDS
-
-
 # =========================================================
 # OANDA API
 # =========================================================
@@ -205,16 +162,6 @@ def get_current_price(pair: str) -> dict:
     return prices[pair]
 
 
-def get_spread(pair: str) -> float:
-    px = get_current_price(pair)
-    return px["ask"] - px["bid"]
-
-
-def spread_allowed(pair: str) -> tuple[bool, float]:
-    spread = get_spread(pair)
-    return spread <= MAX_SPREAD[pair], spread
-
-
 def get_open_trades() -> list[dict]:
     data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/openTrades")
     return data.get("trades", [])
@@ -225,64 +172,6 @@ def get_open_trade_for_pair(pair: str) -> dict | None:
         if trade.get("instrument") == pair:
             return trade
     return None
-
-
-def get_candles(pair: str, count: int = CANDLE_COUNT, granularity: str = ENTRY_GRANULARITY) -> list[dict]:
-    data = oanda_get(
-        f"/instruments/{pair}/candles?price=M&granularity={granularity}&count={count}"
-    )
-    return data.get("candles", [])
-
-
-# =========================================================
-# STRATEGY
-# =========================================================
-def complete_closes(pair: str) -> list[float]:
-    candles = get_candles(pair)
-    closes = []
-
-    for c in candles:
-        if c.get("complete"):
-            closes.append(float(c["mid"]["c"]))
-
-    return closes
-
-
-def last_complete_candle(pair: str) -> dict | None:
-    candles = get_candles(pair, count=5)
-    complete = [c for c in candles if c.get("complete")]
-    if not complete:
-        return None
-    return complete[-1]
-
-
-def simple_trend_ok(signal: str, pair: str) -> tuple[bool, str]:
-    closes = complete_closes(pair)
-    if len(closes) < MID_EMA:
-        return False, "not enough candles"
-
-    fast = ema(closes, FAST_EMA)
-    mid = ema(closes, MID_EMA)
-    last_close = closes[-1]
-
-    if fast is None or mid is None:
-        return False, "ema unavailable"
-
-    candle = last_complete_candle(pair)
-    if not candle:
-        return False, "no candle"
-
-    o = float(candle["mid"]["o"])
-    c = float(candle["mid"]["c"])
-
-    if signal == "BUY":
-        if last_close > fast and fast > mid and c > o:
-            return True, "buy trend ok"
-        return False, "buy blocked"
-
-    if last_close < fast and fast < mid and c < o:
-        return True, "sell trend ok"
-    return False, "sell blocked"
 
 
 def open_trade_slots_available() -> bool:
@@ -321,96 +210,80 @@ def parse_webhook_payload() -> dict:
 
 
 # =========================================================
-# TRADE LOGIC
+# FAST TRADE LOGIC
 # =========================================================
 def place_trade(signal: str, pair: str) -> dict:
     signal = normalize_signal(signal)
     pair = normalize_pair(pair)
 
-    if signal is None:
-        return {"status": "skipped", "reason": "invalid signal"}
-
-    if pair is None:
-        return {"status": "skipped", "reason": "invalid pair"}
+    if signal is None or pair is None:
+        return {"status": "skipped", "reason": "invalid input"}
 
     if pair not in PAIRS:
-        return {"status": "skipped", "reason": f"pair not enabled: {pair}"}
-
-    if not in_session():
-        log(f"{pair} skipped: outside session")
-        return {"status": "skipped", "reason": "outside session"}
+        return {"status": "skipped", "reason": "pair not enabled"}
 
     if not open_trade_slots_available():
-        log(f"{pair} skipped: max total open trades reached")
-        return {"status": "skipped", "reason": "max total open trades reached"}
+        return {"status": "skipped", "reason": "max trades reached"}
 
     if get_open_trade_for_pair(pair):
-        log(f"{pair} skipped: already has open trade")
-        return {"status": "skipped", "reason": f"{pair} already has open trade"}
+        return {"status": "skipped", "reason": "trade already open"}
 
-    if cooldown_active(pair):
-        log(f"{pair} skipped: cooldown active")
-        return {"status": "skipped", "reason": f"{pair} cooldown active"}
+    try:
+        px = get_current_price(pair)
+        bid = px["bid"]
+        ask = px["ask"]
 
-    spread_ok, spread = spread_allowed(pair)
-    if not spread_ok:
-        log(f"{pair} skipped: spread too high {spread}")
-        return {"status": "skipped", "reason": f"spread too high {spread}"}
+        entry = ask if signal == "BUY" else bid
 
-    trend_ok, trend_reason = simple_trend_ok(signal, pair)
-    if not trend_ok:
-        log(f"{pair} skipped: {trend_reason}")
-        return {"status": "skipped", "reason": trend_reason}
+        pip = pip_size(pair)
+        sl_pips = STOP_LOSS[pair]
+        tp_pips = TAKE_PROFIT[pair]
 
-    px = get_current_price(pair)
-    bid = px["bid"]
-    ask = px["ask"]
-    entry = ask if signal == "BUY" else bid
+        if signal == "BUY":
+            units = UNITS
+            sl_price = entry - (sl_pips * pip)
+            tp_price = entry + (tp_pips * pip)
+        else:
+            units = -UNITS
+            sl_price = entry + (sl_pips * pip)
+            tp_price = entry - (tp_pips * pip)
 
-    sl_pips = STOP_LOSS[pair]
-    tp_pips = TAKE_PROFIT[pair]
-    pip = pip_size(pair)
-
-    if signal == "BUY":
-        units = UNITS
-        sl_price = entry - (sl_pips * pip)
-        tp_price = entry + (tp_pips * pip)
-    else:
-        units = -UNITS
-        sl_price = entry + (sl_pips * pip)
-        tp_price = entry - (tp_pips * pip)
-
-    payload = {
-        "order": {
-            "instrument": pair,
-            "units": str(units),
-            "type": "MARKET",
-            "positionFill": "DEFAULT",
-            "timeInForce": "FOK",
-            "stopLossOnFill": {
-                "price": price_format(pair, sl_price)
-            },
-            "takeProfitOnFill": {
-                "price": price_format(pair, tp_price)
+        payload = {
+            "order": {
+                "instrument": pair,
+                "units": str(units),
+                "type": "MARKET",
+                "positionFill": "DEFAULT",
+                "timeInForce": "FOK",
+                "stopLossOnFill": {
+                    "price": price_format(pair, sl_price)
+                },
+                "takeProfitOnFill": {
+                    "price": price_format(pair, tp_price)
+                }
             }
         }
-    }
 
-    log(f"Webhook accepted: signal={signal} pair={pair}")
-    log(f"{pair} sending order: {payload}")
+        log(f"FAST EXECUTION: {signal} {pair}")
+        log(f"{pair} sending order: {payload}")
 
-    response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
+        response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
 
-    log(f"{pair} response: {response}")
+        last_trade_time[pair] = time.time()
 
-    last_trade_time[pair] = time.time()
+        log(f"{pair} trade placed")
+        log(f"{pair} response: {response}")
 
-    return {
-        "status": "placed",
-        "pair": pair,
-        "signal": signal,
-        "response": response,
-    }
+        return {
+            "status": "placed",
+            "pair": pair,
+            "signal": signal,
+            "response": response,
+        }
+
+    except Exception as e:
+        log(f"TRADE ERROR: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 # =========================================================
@@ -492,9 +365,8 @@ def auto_loop() -> None:
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "bot": "OANDA Runner V9 Aggressive",
+        "bot": "OANDA Runner Fast Exec",
         "env": OANDA_ENV,
-        "granularity": ENTRY_GRANULARITY,
         "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
         "pairs": PAIRS,
         "status": "running",
