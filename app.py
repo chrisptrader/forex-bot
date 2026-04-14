@@ -26,14 +26,9 @@ UNITS = int(os.environ.get("UNITS", "3000"))
 ENTRY_GRANULARITY = os.environ.get("GRANULARITY", "M5").strip().upper()
 
 AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "900"))
-REENTRY_BLOCK_SECONDS = int(os.environ.get("REENTRY_BLOCK_SECONDS", "1800"))
-
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "30"))
 MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
-MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "6"))
-MAX_LOSSES_PER_DAY = int(os.environ.get("MAX_LOSSES_PER_DAY", "3"))
 
-# UTC session hours
 SESSION_START_UTC = int(os.environ.get("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.environ.get("SESSION_END_UTC", "20"))
 
@@ -73,27 +68,18 @@ TRAIL_LOCK = {
 }
 
 MAX_SPREAD = {
-    "EUR_USD": 0.00025,
-    "GBP_USD": 0.00040,
-    "USD_JPY": 0.030,
-    "XAU_USD": 1.50,
+    "EUR_USD": 0.00030,
+    "GBP_USD": 0.00045,
+    "USD_JPY": 0.035,
+    "XAU_USD": 1.80,
 }
 
 FAST_EMA = 20
 MID_EMA = 50
-SLOW_EMA = 200
-CANDLE_COUNT = 260
+CANDLE_COUNT = 120
 
 last_trade_time = {}
-blocked_until = {}
 managed_to_be = set()
-
-daily_stats = {
-    "date": None,
-    "trades": 0,
-    "losses": 0,
-    "last_seen_closed_ids": set(),
-}
 
 # =========================================================
 # HELPERS
@@ -104,15 +90,6 @@ def log(message: str) -> None:
 
 def utc_now() -> dt.datetime:
     return dt.datetime.utcnow()
-
-
-def reset_daily_stats_if_needed() -> None:
-    today = utc_now().date().isoformat()
-    if daily_stats["date"] != today:
-        daily_stats["date"] = today
-        daily_stats["trades"] = 0
-        daily_stats["losses"] = 0
-        daily_stats["last_seen_closed_ids"] = set()
 
 
 def headers() -> dict:
@@ -165,6 +142,7 @@ def price_format(pair: str, price: float) -> str:
 def ema(values: list[float], period: int) -> float | None:
     if len(values) < period:
         return None
+
     mult = 2 / (period + 1)
     value = sum(values[:period]) / period
     for v in values[period:]:
@@ -182,17 +160,8 @@ def cooldown_active(pair: str) -> bool:
     return (time.time() - last) < COOLDOWN_SECONDS
 
 
-def pair_blocked(pair: str) -> bool:
-    until = blocked_until.get(pair, 0)
-    return time.time() < until
-
-
-def open_trade_slots_available() -> bool:
-    return len(get_open_trades()) < MAX_TOTAL_OPEN_TRADES
-
-
 # =========================================================
-# OANDA
+# OANDA API
 # =========================================================
 def oanda_get(endpoint: str) -> dict:
     url = f"{BASE_URL}{endpoint}"
@@ -219,11 +188,13 @@ def get_pricing(instruments: list[str]) -> dict[str, dict]:
     joined = ",".join(instruments)
     data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/pricing?instruments={joined}")
     out = {}
+
     for item in data.get("prices", []):
         instrument = item["instrument"]
         bid = float(item["bids"][0]["price"])
         ask = float(item["asks"][0]["price"])
         out[instrument] = {"bid": bid, "ask": ask}
+
     return out
 
 
@@ -256,124 +227,70 @@ def get_open_trade_for_pair(pair: str) -> dict | None:
     return None
 
 
-def get_candles(pair: str, count: int, granularity: str) -> list[dict]:
+def get_candles(pair: str, count: int = CANDLE_COUNT, granularity: str = ENTRY_GRANULARITY) -> list[dict]:
     data = oanda_get(
         f"/instruments/{pair}/candles?price=M&granularity={granularity}&count={count}"
     )
     return data.get("candles", [])
 
 
-def complete_closes(pair: str, granularity: str, count: int = CANDLE_COUNT) -> list[float]:
-    candles = get_candles(pair, count=count, granularity=granularity)
-    out = []
+# =========================================================
+# STRATEGY
+# =========================================================
+def complete_closes(pair: str) -> list[float]:
+    candles = get_candles(pair)
+    closes = []
+
     for c in candles:
         if c.get("complete"):
-            out.append(float(c["mid"]["c"]))
-    return out
+            closes.append(float(c["mid"]["c"]))
+
+    return closes
 
 
-def last_complete_candle(pair: str, granularity: str) -> dict | None:
-    candles = get_candles(pair, count=5, granularity=granularity)
+def last_complete_candle(pair: str) -> dict | None:
+    candles = get_candles(pair, count=5)
     complete = [c for c in candles if c.get("complete")]
     if not complete:
         return None
     return complete[-1]
 
 
-def get_recent_closed_trades() -> list[dict]:
-    # latest closed trades/orders for daily loss tracking
-    data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/trades?state=CLOSED&count=50")
-    return data.get("trades", [])
-
-
-# =========================================================
-# STRATEGY FILTERS
-# =========================================================
-def htf_trend_ok(signal: str, pair: str) -> tuple[bool, str]:
-    # 15m and 1h trend alignment
-    closes_15 = complete_closes(pair, "M15")
-    closes_h1 = complete_closes(pair, "H1")
-
-    if len(closes_15) < SLOW_EMA or len(closes_h1) < SLOW_EMA:
-        return False, "not enough HTF candles"
-
-    fast_15 = ema(closes_15, FAST_EMA)
-    mid_15 = ema(closes_15, MID_EMA)
-    slow_15 = ema(closes_15, SLOW_EMA)
-
-    fast_h1 = ema(closes_h1, FAST_EMA)
-    mid_h1 = ema(closes_h1, MID_EMA)
-    slow_h1 = ema(closes_h1, SLOW_EMA)
-
-    last_15 = closes_15[-1]
-    last_h1 = closes_h1[-1]
-
-    if None in {fast_15, mid_15, slow_15, fast_h1, mid_h1, slow_h1}:
-        return False, "ema unavailable"
-
-    if signal == "BUY":
-        cond = (
-            last_15 > fast_15 > mid_15 > slow_15
-            and last_h1 > fast_h1 > mid_h1 > slow_h1
-        )
-        return (True, "htf buy ok") if cond else (False, "htf blocked buy")
-
-    cond = (
-        last_15 < fast_15 < mid_15 < slow_15
-        and last_h1 < fast_h1 < mid_h1 < slow_h1
-    )
-    return (True, "htf sell ok") if cond else (False, "htf blocked sell")
-
-
-def ltf_entry_ok(signal: str, pair: str) -> tuple[bool, str]:
-    closes = complete_closes(pair, ENTRY_GRANULARITY)
-    if len(closes) < SLOW_EMA:
-        return False, "not enough entry candles"
+def simple_trend_ok(signal: str, pair: str) -> tuple[bool, str]:
+    closes = complete_closes(pair)
+    if len(closes) < MID_EMA:
+        return False, "not enough candles"
 
     fast = ema(closes, FAST_EMA)
     mid = ema(closes, MID_EMA)
-    slow = ema(closes, SLOW_EMA)
     last_close = closes[-1]
 
-    if None in {fast, mid, slow}:
-        return False, "entry ema unavailable"
+    if fast is None or mid is None:
+        return False, "ema unavailable"
 
-    candle = last_complete_candle(pair, ENTRY_GRANULARITY)
+    candle = last_complete_candle(pair)
     if not candle:
-        return False, "entry candle unavailable"
+        return False, "no candle"
 
     o = float(candle["mid"]["o"])
-    h = float(candle["mid"]["h"])
-    l = float(candle["mid"]["l"])
     c = float(candle["mid"]["c"])
-    body = abs(c - o)
-    rng = max(h - l, 0.0000001)
-
-    # Require decent candle body relative to range
-    body_ratio = body / rng
 
     if signal == "BUY":
-        cond = last_close > fast > mid > slow and c > o and body_ratio >= 0.35
-        return (True, "ltf buy ok") if cond else (False, "ltf blocked buy")
+        if last_close > fast and fast > mid and c > o:
+            return True, "buy trend ok"
+        return False, "buy blocked"
 
-    cond = last_close < fast < mid < slow and c < o and body_ratio >= 0.35
-    return (True, "ltf sell ok") if cond else (False, "ltf blocked sell")
+    if last_close < fast and fast < mid and c < o:
+        return True, "sell trend ok"
+    return False, "sell blocked"
 
 
-def daily_limits_ok() -> tuple[bool, str]:
-    reset_daily_stats_if_needed()
-
-    if daily_stats["trades"] >= MAX_TRADES_PER_DAY:
-        return False, "daily trade limit reached"
-
-    if daily_stats["losses"] >= MAX_LOSSES_PER_DAY:
-        return False, "daily loss limit reached"
-
-    return True, "daily limits ok"
+def open_trade_slots_available() -> bool:
+    return len(get_open_trades()) < MAX_TOTAL_OPEN_TRADES
 
 
 # =========================================================
-# WEBHOOK PARSING
+# WEBHOOK PARSER
 # =========================================================
 def parse_webhook_payload() -> dict:
     data = request.get_json(silent=True)
@@ -404,11 +321,9 @@ def parse_webhook_payload() -> dict:
 
 
 # =========================================================
-# TRADE ACTIONS
+# TRADE LOGIC
 # =========================================================
 def place_trade(signal: str, pair: str) -> dict:
-    reset_daily_stats_if_needed()
-
     signal = normalize_signal(signal)
     pair = normalize_pair(pair)
 
@@ -422,35 +337,30 @@ def place_trade(signal: str, pair: str) -> dict:
         return {"status": "skipped", "reason": f"pair not enabled: {pair}"}
 
     if not in_session():
+        log(f"{pair} skipped: outside session")
         return {"status": "skipped", "reason": "outside session"}
 
-    limits_ok, limits_reason = daily_limits_ok()
-    if not limits_ok:
-        return {"status": "skipped", "reason": limits_reason}
-
     if not open_trade_slots_available():
+        log(f"{pair} skipped: max total open trades reached")
         return {"status": "skipped", "reason": "max total open trades reached"}
 
     if get_open_trade_for_pair(pair):
+        log(f"{pair} skipped: already has open trade")
         return {"status": "skipped", "reason": f"{pair} already has open trade"}
 
     if cooldown_active(pair):
+        log(f"{pair} skipped: cooldown active")
         return {"status": "skipped", "reason": f"{pair} cooldown active"}
-
-    if pair_blocked(pair):
-        return {"status": "skipped", "reason": f"{pair} reentry blocked"}
 
     spread_ok, spread = spread_allowed(pair)
     if not spread_ok:
-        return {"status": "skipped", "reason": f"{pair} spread too high: {spread}"}
+        log(f"{pair} skipped: spread too high {spread}")
+        return {"status": "skipped", "reason": f"spread too high {spread}"}
 
-    htf_ok, htf_reason = htf_trend_ok(signal, pair)
-    if not htf_ok:
-        return {"status": "skipped", "reason": htf_reason}
-
-    ltf_ok, ltf_reason = ltf_entry_ok(signal, pair)
-    if not ltf_ok:
-        return {"status": "skipped", "reason": ltf_reason}
+    trend_ok, trend_reason = simple_trend_ok(signal, pair)
+    if not trend_ok:
+        log(f"{pair} skipped: {trend_reason}")
+        return {"status": "skipped", "reason": trend_reason}
 
     px = get_current_price(pair)
     bid = px["bid"]
@@ -487,41 +397,25 @@ def place_trade(signal: str, pair: str) -> dict:
     }
 
     log(f"Webhook accepted: signal={signal} pair={pair}")
-    log(f"{pair} Sending: {payload}")
+    log(f"{pair} sending order: {payload}")
 
     response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-    log(f"{pair} Response: {response}")
+
+    log(f"{pair} response: {response}")
 
     last_trade_time[pair] = time.time()
-    daily_stats["trades"] += 1
 
-    return {"status": "placed", "pair": pair, "signal": signal, "response": response}
+    return {
+        "status": "placed",
+        "pair": pair,
+        "signal": signal,
+        "response": response,
+    }
 
 
 # =========================================================
 # TRADE MANAGEMENT
 # =========================================================
-def update_daily_loss_count() -> None:
-    reset_daily_stats_if_needed()
-    closed = get_recent_closed_trades()
-
-    for trade in closed:
-        trade_id = trade.get("id")
-        if trade_id in daily_stats["last_seen_closed_ids"]:
-            continue
-
-        daily_stats["last_seen_closed_ids"].add(trade_id)
-
-        instrument = trade.get("instrument")
-        realized_pl = float(trade.get("realizedPL", "0"))
-
-        if realized_pl < 0:
-            daily_stats["losses"] += 1
-            if instrument:
-                blocked_until[instrument] = time.time() + REENTRY_BLOCK_SECONDS
-                log(f"🛑 {instrument} reentry blocked after loss")
-
-
 def manage_open_trades() -> None:
     trades = get_open_trades()
     if not trades:
@@ -546,21 +440,20 @@ def manage_open_trades() -> None:
 
             log(f"{pair} pips in profit: {pips_profit}")
 
-            # Move to breakeven once
             if pips_profit >= BREAK_EVEN[pair] and trade_id not in managed_to_be:
                 be_payload = {
                     "stopLoss": {
                         "price": price_format(pair, entry)
                     }
                 }
+
                 response = oanda_put(
                     f"/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
                     be_payload,
                 )
                 managed_to_be.add(trade_id)
-                log(f"🔥 {pair} moved to breakeven: {response}")
+                log(f"{pair} moved to breakeven: {response}")
 
-            # Trail after profit threshold
             if pips_profit >= TRAIL_AFTER[pair]:
                 if units > 0:
                     new_sl = current - (TRAIL_LOCK[pair] * pip)
@@ -577,7 +470,7 @@ def manage_open_trades() -> None:
                     f"/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
                     trail_payload,
                 )
-                log(f"📈 {pair} trailing stop updated: {response}")
+                log(f"{pair} trailing stop updated: {response}")
 
         except Exception as e:
             log(f"manage error: {e}")
@@ -585,11 +478,6 @@ def manage_open_trades() -> None:
 
 def auto_loop() -> None:
     while True:
-        try:
-            update_daily_loss_count()
-        except Exception as e:
-            log(f"daily stats error: {e}")
-
         try:
             manage_open_trades()
         except Exception as e:
@@ -603,17 +491,14 @@ def auto_loop() -> None:
 # =========================================================
 @app.route("/", methods=["GET"])
 def home():
-    reset_daily_stats_if_needed()
     return jsonify({
-        "bot": "OANDA Runner V9 Sniper",
+        "bot": "OANDA Runner V9 Aggressive",
         "env": OANDA_ENV,
         "granularity": ENTRY_GRANULARITY,
         "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
         "pairs": PAIRS,
         "status": "running",
         "units": UNITS,
-        "daily_trades": daily_stats["trades"],
-        "daily_losses": daily_stats["losses"],
     })
 
 
