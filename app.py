@@ -19,21 +19,23 @@ if OANDA_ENV == "live":
 else:
     BASE_URL = "https://api-fxpractice.oanda.com/v3"
 
-PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"]
+DEFAULT_PAIRS = ["GBP_USD", "USD_JPY"]
+PAIRS_ENV = os.environ.get("PAIRS", "").strip()
+PAIRS = [p.strip().upper() for p in PAIRS_ENV.split(",") if p.strip()] if PAIRS_ENV else DEFAULT_PAIRS
 
 UNITS = int(os.environ.get("UNITS", "3000"))
 AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
 MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
 
-# Trend + momentum
 EMA_PERIOD = int(os.environ.get("EMA_PERIOD", "20"))
 TREND_GRANULARITY = os.environ.get("TREND_GRANULARITY", "M5").strip().upper()
 MOMENTUM_LOOKBACK = int(os.environ.get("MOMENTUM_LOOKBACK", "3"))
+BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "5"))
 
 STOP_LOSS = {
-    "EUR_USD": 12,
-    "GBP_USD": 12,
-    "USD_JPY": 12,
+    "EUR_USD": 10,
+    "GBP_USD": 10,
+    "USD_JPY": 10,
     "XAU_USD": 250,
 }
 
@@ -65,7 +67,6 @@ TRAIL_LOCK = {
     "XAU_USD": 120,
 }
 
-last_trade_time = {}
 managed_to_be = set()
 
 # =========================================================
@@ -192,11 +193,9 @@ def open_trade_slots_available() -> bool:
 
 
 def get_candles_raw(pair: str, granularity: str = "M5", count: int = 60) -> list[dict]:
-    endpoint = (
-        f"/instruments/{pair}/candles"
-        f"?price=M&granularity={granularity}&count={count}"
-    )
+    endpoint = f"/instruments/{pair}/candles?price=M&granularity={granularity}&count={count}"
     data = oanda_get(endpoint)
+
     candles = []
     for candle in data.get("candles", []):
         if candle.get("complete"):
@@ -211,14 +210,10 @@ def get_candles_raw(pair: str, granularity: str = "M5", count: int = 60) -> list
 
 
 # =========================================================
-# V10 FILTERS
+# FILTERS
 # =========================================================
 def trend_allowed(pair: str, signal: str) -> tuple[bool, dict]:
-    candles = get_candles_raw(
-        pair,
-        granularity=TREND_GRANULARITY,
-        count=max(EMA_PERIOD + 15, 50),
-    )
+    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(EMA_PERIOD + 15, 50))
     closes = [c["c"] for c in candles]
 
     if len(closes) < EMA_PERIOD:
@@ -250,14 +245,14 @@ def momentum_allowed(pair: str, signal: str) -> tuple[bool, dict]:
         return False, {"reason": "not enough momentum candles"}
 
     recent = candles[-MOMENTUM_LOOKBACK:]
-    bodies = [abs(c["c"] - c["o"]) for c in recent]
-    total_body = sum(bodies)
     last = recent[-1]
-    last_body = abs(last["c"] - last["o"])
-    candle_range = max(last["h"] - last["l"], 1e-9)
 
     bullish_count = sum(1 for c in recent if c["c"] > c["o"])
     bearish_count = sum(1 for c in recent if c["c"] < c["o"])
+
+    last_body = abs(last["c"] - last["o"])
+    last_range = max(last["h"] - last["l"], 1e-9)
+    body_ratio_ok = (last_body / last_range) >= 0.45
 
     info = {
         "pair": pair,
@@ -266,20 +261,44 @@ def momentum_allowed(pair: str, signal: str) -> tuple[bool, dict]:
         "last_open": round(last["o"], 6),
         "last_close": round(last["c"], 6),
         "last_body": round(last_body, 6),
-        "last_range": round(candle_range, 6),
+        "last_range": round(last_range, 6),
         "bullish_count": bullish_count,
         "bearish_count": bearish_count,
     }
-
-    # Strong directional candle with decent body relative to range
-    body_ratio_ok = (last_body / candle_range) >= 0.45
 
     if signal == "BUY":
         direction_ok = last["c"] > last["o"] and bullish_count >= 2
     else:
         direction_ok = last["c"] < last["o"] and bearish_count >= 2
 
-    allowed = direction_ok and body_ratio_ok
+    return direction_ok and body_ratio_ok, info
+
+
+def breakout_allowed(pair: str, signal: str) -> tuple[bool, dict]:
+    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(BREAKOUT_LOOKBACK + 3, 10))
+    if len(candles) < BREAKOUT_LOOKBACK + 1:
+        return False, {"reason": "not enough breakout candles"}
+
+    recent_closed = candles[-(BREAKOUT_LOOKBACK + 1):-1]
+    last = candles[-1]
+
+    recent_high = max(c["h"] for c in recent_closed)
+    recent_low = min(c["l"] for c in recent_closed)
+
+    info = {
+        "pair": pair,
+        "signal": signal,
+        "lookback": BREAKOUT_LOOKBACK,
+        "last_close": round(last["c"], 6),
+        "recent_high": round(recent_high, 6),
+        "recent_low": round(recent_low, 6),
+    }
+
+    if signal == "BUY":
+        allowed = last["c"] > recent_high
+    else:
+        allowed = last["c"] < recent_low
+
     return allowed, info
 
 
@@ -336,18 +355,12 @@ def place_trade(signal: str, pair: str) -> dict:
     try:
         trend_ok, trend_info = trend_allowed(pair, signal)
         log(f"TREND CHECK: {trend_info}")
-
         if not trend_ok:
             log(f"SKIPPED {pair} {signal}: trend filter blocked")
-            return {
-                "status": "skipped",
-                "reason": "trend filter blocked",
-                "trend": trend_info,
-            }
+            return {"status": "skipped", "reason": "trend filter blocked", "trend": trend_info}
 
         momentum_ok, momentum_info = momentum_allowed(pair, signal)
         log(f"MOMENTUM CHECK: {momentum_info}")
-
         if not momentum_ok:
             log(f"SKIPPED {pair} {signal}: momentum filter blocked")
             return {
@@ -355,6 +368,18 @@ def place_trade(signal: str, pair: str) -> dict:
                 "reason": "momentum filter blocked",
                 "trend": trend_info,
                 "momentum": momentum_info,
+            }
+
+        breakout_ok, breakout_info = breakout_allowed(pair, signal)
+        log(f"BREAKOUT CHECK: {breakout_info}")
+        if not breakout_ok:
+            log(f"SKIPPED {pair} {signal}: breakout filter blocked")
+            return {
+                "status": "skipped",
+                "reason": "breakout filter blocked",
+                "trend": trend_info,
+                "momentum": momentum_info,
+                "breakout": breakout_info,
             }
 
         px = get_current_price(pair)
@@ -391,11 +416,10 @@ def place_trade(signal: str, pair: str) -> dict:
             }
         }
 
-        log(f"SNIPER EXECUTION: {signal} {pair}")
+        log(f"V11 EXECUTION: {signal} {pair}")
         log(f"{pair} sending order: {payload}")
 
         response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-        last_trade_time[pair] = time.time()
 
         log(f"{pair} trade placed")
         log(f"{pair} response: {response}")
@@ -406,6 +430,7 @@ def place_trade(signal: str, pair: str) -> dict:
             "signal": signal,
             "trend": trend_info,
             "momentum": momentum_info,
+            "breakout": breakout_info,
             "response": response,
         }
 
@@ -435,7 +460,6 @@ def manage_open_trades() -> None:
             if not px:
                 continue
 
-            # Signed pips profit
             if units > 0:
                 current = px["bid"]
                 pips_profit = (current - entry) / pip_size(pair)
@@ -489,7 +513,6 @@ def auto_loop() -> None:
             manage_open_trades()
         except Exception as e:
             log(f"manage loop error: {e}")
-
         time.sleep(AUTO_CHECK_SECONDS)
 
 
@@ -499,13 +522,14 @@ def auto_loop() -> None:
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "bot": "OANDA Runner V10 Sniper",
+        "bot": "OANDA Runner V11 Final",
         "env": OANDA_ENV,
+        "pairs": PAIRS,
         "trend_granularity": TREND_GRANULARITY,
         "ema_period": EMA_PERIOD,
         "momentum_lookback": MOMENTUM_LOOKBACK,
+        "breakout_lookback": BREAKOUT_LOOKBACK,
         "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
-        "pairs": PAIRS,
         "status": "running",
         "units": UNITS,
     })
@@ -517,10 +541,8 @@ def webhook():
         data = parse_webhook_payload()
         signal = data.get("signal")
         pair = data.get("pair")
-
         result = place_trade(signal, pair)
         return jsonify(result), 200
-
     except Exception as e:
         log(f"Webhook error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
