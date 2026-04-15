@@ -1,558 +1,491 @@
-from flask import Flask, request, jsonify
 import os
 import time
-import json
+import math
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# =========================================================
-# CONFIG
-# =========================================================
-OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "").strip()
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "").strip()
-OANDA_ENV = os.environ.get("OANDA_ENV", "practice").strip().lower()
+# =========================
+# ENVIRONMENT VARIABLES
+# =========================
+API_KEY = os.getenv("OANDA_API_KEY", "").strip()
+ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+OANDA_ENV = os.getenv("OANDA_ENV", "practice").strip().lower()
 
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "").strip()
+
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2"))              # % risk per trade
+STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "20"))
+TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "50"))
+
+USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "true").strip().lower() == "true"
+TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "15"))
+TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "10"))
+
+ALLOW_MULTIPAIR = os.getenv("ALLOW_MULTIPAIR", "true").strip().lower() == "true"
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
+
+ENABLE_SESSION_FILTER = os.getenv("ENABLE_SESSION_FILTER", "true").strip().lower() == "true"
+TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", "America/New_York").strip()
+
+LONDON_START = int(os.getenv("LONDON_START", "3"))   # 3 AM NY time
+LONDON_END = int(os.getenv("LONDON_END", "6"))       # 6 AM NY time
+NY_START = int(os.getenv("NY_START", "8"))           # 8 AM NY time
+NY_END = int(os.getenv("NY_END", "11"))              # 11 AM NY time
+
+MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "10"))       # seconds
+MIN_SECONDS_BETWEEN_TRADES = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "60"))
+
+# Optional fixed fallback units if risk calc fails
+FALLBACK_UNITS = int(os.getenv("FALLBACK_UNITS", "100"))
+
+# =========================
+# OANDA BASE URL
+# =========================
 if OANDA_ENV == "live":
-    BASE_URL = "https://api-fxtrade.oanda.com/v3"
+    BASE_URL = "https://api-fxtrade.oanda.com"
 else:
-    BASE_URL = "https://api-fxpractice.oanda.com/v3"
+    BASE_URL = "https://api-fxpractice.oanda.com"
 
-DEFAULT_PAIRS = ["GBP_USD", "USD_JPY"]
-PAIRS_ENV = os.environ.get("PAIRS", "").strip()
-PAIRS = [p.strip().upper() for p in PAIRS_ENV.split(",") if p.strip()] if PAIRS_ENV else DEFAULT_PAIRS
-
-UNITS = int(os.environ.get("UNITS", "3000"))
-AUTO_CHECK_SECONDS = int(os.environ.get("AUTO_CHECK_SECONDS", "10"))
-MAX_TOTAL_OPEN_TRADES = int(os.environ.get("MAX_TOTAL_OPEN_TRADES", "2"))
-
-EMA_PERIOD = int(os.environ.get("EMA_PERIOD", "20"))
-TREND_GRANULARITY = os.environ.get("TREND_GRANULARITY", "M5").strip().upper()
-MOMENTUM_LOOKBACK = int(os.environ.get("MOMENTUM_LOOKBACK", "3"))
-BREAKOUT_LOOKBACK = int(os.environ.get("BREAKOUT_LOOKBACK", "5"))
-
-STOP_LOSS = {
-    "EUR_USD": 10,
-    "GBP_USD": 10,
-    "USD_JPY": 10,
-    "XAU_USD": 250,
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
 }
 
-TAKE_PROFIT = {
-    "EUR_USD": 24,
-    "GBP_USD": 24,
-    "USD_JPY": 22,
-    "XAU_USD": 500,
-}
+# Keeps track of last signal time per pair
+last_trade_time = {}
+# Keeps track of active monitor threads per trade ID
+active_monitors = {}
 
-BREAK_EVEN = {
-    "EUR_USD": 8,
-    "GBP_USD": 8,
-    "USD_JPY": 7,
-    "XAU_USD": 180,
-}
 
-TRAIL_AFTER = {
-    "EUR_USD": 12,
-    "GBP_USD": 12,
-    "USD_JPY": 10,
-    "XAU_USD": 250,
-}
-
-TRAIL_LOCK = {
-    "EUR_USD": 6,
-    "GBP_USD": 6,
-    "USD_JPY": 5,
-    "XAU_USD": 120,
-}
-
-managed_to_be = set()
-
-# =========================================================
+# =========================
 # HELPERS
-# =========================================================
-def log(message: str) -> None:
-    print(message, flush=True)
+# =========================
+def log(msg: str) -> None:
+    print(f"[{datetime.utcnow().isoformat()} UTC] {msg}", flush=True)
 
 
-def headers() -> dict:
-    return {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
-    }
+def pip_size_for_pair(pair: str) -> float:
+    return 0.01 if "JPY" in pair else 0.0001
 
 
-def normalize_pair(pair: str | None) -> str | None:
-    if not pair:
-        return None
-    p = str(pair).strip().upper().replace("/", "_")
-    mapping = {
-        "EURUSD": "EUR_USD",
-        "GBPUSD": "GBP_USD",
-        "USDJPY": "USD_JPY",
-        "XAUUSD": "XAU_USD",
-        "EUR_USD": "EUR_USD",
-        "GBP_USD": "GBP_USD",
-        "USD_JPY": "USD_JPY",
-        "XAU_USD": "XAU_USD",
-    }
-    return mapping.get(p)
+def is_trading_session() -> bool:
+    if not ENABLE_SESSION_FILTER:
+        return True
+
+    try:
+        tz = ZoneInfo(TIMEZONE_NAME)
+        now_local = datetime.now(tz)
+        hour = now_local.hour
+
+        london_open = LONDON_START <= hour < LONDON_END
+        ny_open = NY_START <= hour < NY_END
+
+        return london_open or ny_open
+    except Exception as e:
+        log(f"Session filter error, allowing trade: {e}")
+        return True
 
 
-def normalize_signal(signal: str | None) -> str | None:
-    if not signal:
-        return None
-    s = str(signal).strip().upper()
-    return s if s in {"BUY", "SELL"} else None
+def get_account_details():
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}"
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    return response.json().get("account", {})
 
 
-def pip_size(pair: str) -> float:
-    if pair == "USD_JPY":
-        return 0.01
-    if pair == "XAU_USD":
-        return 0.01
-    return 0.0001
+def get_account_balance() -> float:
+    account = get_account_details()
+    return float(account.get("balance", 0))
 
 
-def price_format(pair: str, price: float) -> str:
-    if pair == "USD_JPY":
-        return f"{price:.3f}"
-    if pair == "XAU_USD":
-        return f"{price:.2f}"
-    return f"{price:.5f}"
+def get_price(pair: str):
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}/pricing"
+    params = {"instruments": pair}
+    response = requests.get(url, headers=HEADERS, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    prices = data.get("prices", [])
+    if not prices:
+        raise ValueError(f"No pricing returned for {pair}")
+
+    price_info = prices[0]
+    bid = float(price_info["bids"][0]["price"])
+    ask = float(price_info["asks"][0]["price"])
+    return bid, ask
 
 
-def ema(values: list[float], period: int) -> float:
-    if len(values) < period:
-        raise ValueError(f"Need at least {period} values for EMA")
-    k = 2 / (period + 1)
-    current_ema = sum(values[:period]) / period
-    for v in values[period:]:
-        current_ema = (v * k) + (current_ema * (1 - k))
-    return current_ema
+def get_open_trades():
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}/openTrades"
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    return response.json().get("trades", [])
 
 
-# =========================================================
-# OANDA API
-# =========================================================
-def oanda_get(endpoint: str) -> dict:
-    url = f"{BASE_URL}{endpoint}"
-    r = requests.get(url, headers=headers(), timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def oanda_post(endpoint: str, payload: dict) -> dict:
-    url = f"{BASE_URL}{endpoint}"
-    r = requests.post(url, headers=headers(), json=payload, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def oanda_put(endpoint: str, payload: dict) -> dict:
-    url = f"{BASE_URL}{endpoint}"
-    r = requests.put(url, headers=headers(), json=payload, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def get_pricing(instruments: list[str]) -> dict[str, dict]:
-    joined = ",".join(instruments)
-    data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/pricing?instruments={joined}")
-    out = {}
-    for item in data.get("prices", []):
-        instrument = item["instrument"]
-        bid = float(item["bids"][0]["price"])
-        ask = float(item["asks"][0]["price"])
-        out[instrument] = {"bid": bid, "ask": ask}
-    return out
-
-
-def get_current_price(pair: str) -> dict:
-    prices = get_pricing([pair])
-    if pair not in prices:
-        raise RuntimeError(f"No pricing returned for {pair}")
-    return prices[pair]
-
-
-def get_open_trades() -> list[dict]:
-    data = oanda_get(f"/accounts/{OANDA_ACCOUNT_ID}/openTrades")
-    return data.get("trades", [])
-
-
-def get_open_trade_for_pair(pair: str) -> dict | None:
-    for trade in get_open_trades():
+def get_open_trade_for_pair(pair: str):
+    trades = get_open_trades()
+    for trade in trades:
         if trade.get("instrument") == pair:
             return trade
     return None
 
 
-def open_trade_slots_available() -> bool:
-    return len(get_open_trades()) < MAX_TOTAL_OPEN_TRADES
-
-
-def get_candles_raw(pair: str, granularity: str = "M5", count: int = 60) -> list[dict]:
-    endpoint = f"/instruments/{pair}/candles?price=M&granularity={granularity}&count={count}"
-    data = oanda_get(endpoint)
-
-    candles = []
-    for candle in data.get("candles", []):
-        if candle.get("complete"):
-            candles.append({
-                "o": float(candle["mid"]["o"]),
-                "h": float(candle["mid"]["h"]),
-                "l": float(candle["mid"]["l"]),
-                "c": float(candle["mid"]["c"]),
-                "time": candle.get("time"),
-            })
-    return candles
-
-
-# =========================================================
-# FILTERS
-# =========================================================
-def trend_allowed(pair: str, signal: str) -> tuple[bool, dict]:
-    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(EMA_PERIOD + 15, 50))
-    closes = [c["c"] for c in candles]
-
-    if len(closes) < EMA_PERIOD:
-        return False, {"reason": "not enough candle data"}
-
-    current_ema = ema(closes, EMA_PERIOD)
-    last_close = closes[-1]
-
-    info = {
-        "pair": pair,
-        "signal": signal,
-        "last_close": round(last_close, 6),
-        "ema": round(current_ema, 6),
-        "granularity": TREND_GRANULARITY,
-        "ema_period": EMA_PERIOD,
-    }
-
-    if signal == "BUY":
-        allowed = last_close > current_ema
-    else:
-        allowed = last_close < current_ema
-
-    return allowed, info
-
-
-def momentum_allowed(pair: str, signal: str) -> tuple[bool, dict]:
-    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(MOMENTUM_LOOKBACK + 3, 8))
-    if len(candles) < MOMENTUM_LOOKBACK:
-        return False, {"reason": "not enough momentum candles"}
-
-    recent = candles[-MOMENTUM_LOOKBACK:]
-    last = recent[-1]
-
-    bullish_count = sum(1 for c in recent if c["c"] > c["o"])
-    bearish_count = sum(1 for c in recent if c["c"] < c["o"])
-
-    last_body = abs(last["c"] - last["o"])
-    last_range = max(last["h"] - last["l"], 1e-9)
-    body_ratio_ok = (last_body / last_range) >= 0.45
-
-    info = {
-        "pair": pair,
-        "signal": signal,
-        "lookback": MOMENTUM_LOOKBACK,
-        "last_open": round(last["o"], 6),
-        "last_close": round(last["c"], 6),
-        "last_body": round(last_body, 6),
-        "last_range": round(last_range, 6),
-        "bullish_count": bullish_count,
-        "bearish_count": bearish_count,
-    }
-
-    if signal == "BUY":
-        direction_ok = last["c"] > last["o"] and bullish_count >= 2
-    else:
-        direction_ok = last["c"] < last["o"] and bearish_count >= 2
-
-    return direction_ok and body_ratio_ok, info
-
-
-def breakout_allowed(pair: str, signal: str) -> tuple[bool, dict]:
-    candles = get_candles_raw(pair, granularity=TREND_GRANULARITY, count=max(BREAKOUT_LOOKBACK + 3, 10))
-    if len(candles) < BREAKOUT_LOOKBACK + 1:
-        return False, {"reason": "not enough breakout candles"}
-
-    recent_closed = candles[-(BREAKOUT_LOOKBACK + 1):-1]
-    last = candles[-1]
-
-    recent_high = max(c["h"] for c in recent_closed)
-    recent_low = min(c["l"] for c in recent_closed)
-
-    info = {
-        "pair": pair,
-        "signal": signal,
-        "lookback": BREAKOUT_LOOKBACK,
-        "last_close": round(last["c"], 6),
-        "recent_high": round(recent_high, 6),
-        "recent_low": round(recent_low, 6),
-    }
-
-    if signal == "BUY":
-        allowed = last["c"] > recent_high
-    else:
-        allowed = last["c"] < recent_low
-
-    return allowed, info
-
-
-# =========================================================
-# WEBHOOK PARSER
-# =========================================================
-def parse_webhook_payload() -> dict:
-    data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        return data
-
-    raw = request.get_data(as_text=True).strip()
-    if not raw:
-        raise ValueError("empty payload")
-
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-        if isinstance(parsed, str):
-            parsed2 = json.loads(parsed)
-            if isinstance(parsed2, dict):
-                return parsed2
-    except Exception:
-        pass
-
-    cleaned = raw.strip().strip('"').replace('\\"', '"')
-    parsed = json.loads(cleaned)
-    if isinstance(parsed, dict):
-        return parsed
-
-    raise ValueError("invalid payload format")
-
-
-# =========================================================
-# TRADE LOGIC
-# =========================================================
-def place_trade(signal: str, pair: str) -> dict:
-    signal = normalize_signal(signal)
-    pair = normalize_pair(pair)
-
-    if signal is None or pair is None:
-        return {"status": "skipped", "reason": "invalid input"}
-
-    if pair not in PAIRS:
-        return {"status": "skipped", "reason": "pair not enabled"}
-
-    if not open_trade_slots_available():
-        return {"status": "skipped", "reason": "max trades reached"}
-
-    if get_open_trade_for_pair(pair):
-        return {"status": "skipped", "reason": "trade already open"}
-
-    try:
-        trend_ok, trend_info = trend_allowed(pair, signal)
-        log(f"TREND CHECK: {trend_info}")
-        if not trend_ok:
-            log(f"SKIPPED {pair} {signal}: trend filter blocked")
-            return {"status": "skipped", "reason": "trend filter blocked", "trend": trend_info}
-
-        momentum_ok, momentum_info = momentum_allowed(pair, signal)
-        log(f"MOMENTUM CHECK: {momentum_info}")
-        if not momentum_ok:
-            log(f"SKIPPED {pair} {signal}: momentum filter blocked")
-            return {
-                "status": "skipped",
-                "reason": "momentum filter blocked",
-                "trend": trend_info,
-                "momentum": momentum_info,
-            }
-
-        breakout_ok, breakout_info = breakout_allowed(pair, signal)
-        log(f"BREAKOUT CHECK: {breakout_info}")
-        if not breakout_ok:
-            log(f"SKIPPED {pair} {signal}: breakout filter blocked")
-            return {
-                "status": "skipped",
-                "reason": "breakout filter blocked",
-                "trend": trend_info,
-                "momentum": momentum_info,
-                "breakout": breakout_info,
-            }
-
-        px = get_current_price(pair)
-        bid = px["bid"]
-        ask = px["ask"]
-        entry = ask if signal == "BUY" else bid
-
-        pip = pip_size(pair)
-        sl_pips = STOP_LOSS[pair]
-        tp_pips = TAKE_PROFIT[pair]
-
-        if signal == "BUY":
-            units = UNITS
-            sl_price = entry - (sl_pips * pip)
-            tp_price = entry + (tp_pips * pip)
-        else:
-            units = -UNITS
-            sl_price = entry + (sl_pips * pip)
-            tp_price = entry - (tp_pips * pip)
-
-        payload = {
-            "order": {
-                "instrument": pair,
-                "units": str(units),
-                "type": "MARKET",
-                "positionFill": "DEFAULT",
-                "timeInForce": "FOK",
-                "stopLossOnFill": {
-                    "price": price_format(pair, sl_price)
-                },
-                "takeProfitOnFill": {
-                    "price": price_format(pair, tp_price)
-                }
-            }
-        }
-
-        log(f"V11 EXECUTION: {signal} {pair}")
-        log(f"{pair} sending order: {payload}")
-
-        response = oanda_post(f"/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-
-        log(f"{pair} trade placed")
-        log(f"{pair} response: {response}")
-
-        return {
-            "status": "placed",
-            "pair": pair,
-            "signal": signal,
-            "trend": trend_info,
-            "momentum": momentum_info,
-            "breakout": breakout_info,
-            "response": response,
-        }
-
-    except Exception as e:
-        log(f"TRADE ERROR: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-# =========================================================
-# TRADE MANAGEMENT
-# =========================================================
-def manage_open_trades() -> None:
+def get_trade_by_id(trade_id: str):
     trades = get_open_trades()
-    if not trades:
+    for trade in trades:
+        if str(trade.get("id")) == str(trade_id):
+            return trade
+    return None
+
+
+def count_open_trades() -> int:
+    return len(get_open_trades())
+
+
+def pair_recently_traded(pair: str) -> bool:
+    last_time = last_trade_time.get(pair)
+    if not last_time:
+        return False
+    return (time.time() - last_time) < MIN_SECONDS_BETWEEN_TRADES
+
+
+def calculate_units(pair: str, stop_loss_pips: float) -> int:
+    """
+    Simple risk model:
+    risk_amount = balance * risk%
+    units = risk_amount / price_distance
+
+    This is a simplified approximation and works well enough to keep size controlled.
+    """
+    try:
+        balance = get_account_balance()
+        risk_amount = balance * (RISK_PERCENT / 100.0)
+
+        bid, ask = get_price(pair)
+        entry_price = ask
+
+        pip_size = pip_size_for_pair(pair)
+        stop_distance_price = stop_loss_pips * pip_size
+
+        if stop_distance_price <= 0:
+            return FALLBACK_UNITS
+
+        raw_units = risk_amount / stop_distance_price
+
+        # cap crazy sizes for safety
+        units = max(1, min(int(raw_units), 100000))
+        return units
+    except Exception as e:
+        log(f"Risk sizing failed for {pair}, using fallback units. Error: {e}")
+        return FALLBACK_UNITS
+
+
+def close_trade(trade_id: str):
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}/trades/{trade_id}/close"
+    response = requests.put(url, headers=HEADERS, json={}, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def update_trade_sl(trade_id: str, new_sl_price: float):
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
+    payload = {
+        "stopLoss": {
+            "timeInForce": "GTC",
+            "price": f"{new_sl_price:.5f}"
+        }
+    }
+    response = requests.put(url, headers=HEADERS, json=payload, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def create_market_order(pair: str, side: str):
+    """
+    side: BUY or SELL
+    """
+    side = side.upper().strip()
+    if side not in ["BUY", "SELL"]:
+        raise ValueError("side must be BUY or SELL")
+
+    units = calculate_units(pair, STOP_LOSS_PIPS)
+    if side == "SELL":
+        units = -abs(units)
+    else:
+        units = abs(units)
+
+    bid, ask = get_price(pair)
+    pip_size = pip_size_for_pair(pair)
+
+    entry_price = ask if units > 0 else bid
+    sl_price = entry_price - (STOP_LOSS_PIPS * pip_size) if units > 0 else entry_price + (STOP_LOSS_PIPS * pip_size)
+    tp_price = entry_price + (TAKE_PROFIT_PIPS * pip_size) if units > 0 else entry_price - (TAKE_PROFIT_PIPS * pip_size)
+
+    payload = {
+        "order": {
+            "type": "MARKET",
+            "instrument": pair,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {
+                "price": f"{sl_price:.5f}"
+            },
+            "takeProfitOnFill": {
+                "price": f"{tp_price:.5f}"
+            }
+        }
+    }
+
+    url = f"{BASE_URL}/v3/accounts/{ACCOUNT_ID}/orders"
+    response = requests.post(url, headers=HEADERS, json=payload, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+
+    order_fill = data.get("orderFillTransaction", {})
+    trade_opened = order_fill.get("tradeOpened", {})
+    trade_id = trade_opened.get("tradeID")
+
+    log(
+        f"ORDER FILLED | pair={pair} side={side} units={units} "
+        f"entry={entry_price:.5f} SL={sl_price:.5f} TP={tp_price:.5f} trade_id={trade_id}"
+    )
+
+    return data, str(trade_id) if trade_id else None
+
+
+def calculate_pips(trade, bid: float, ask: float) -> float:
+    pair = trade["instrument"]
+    entry_price = float(trade["price"])
+    current_units = float(trade["currentUnits"])
+    pip_size = pip_size_for_pair(pair)
+
+    if current_units > 0:
+        current_price = bid
+        pips = (current_price - entry_price) / pip_size
+    else:
+        current_price = ask
+        pips = (entry_price - current_price) / pip_size
+
+    return round(pips, 1)
+
+
+def maybe_trail_stop(trade):
+    if not USE_TRAILING_STOP:
         return
 
-    pricing = get_pricing(PAIRS)
+    trade_id = str(trade["id"])
+    pair = trade["instrument"]
+    units = float(trade["currentUnits"])
+    entry_price = float(trade["price"])
+    pip_size = pip_size_for_pair(pair)
 
-    for trade in trades:
-        try:
-            pair = trade["instrument"]
-            trade_id = trade["id"]
-            entry = float(trade["price"])
-            units = float(trade["currentUnits"])
+    bid, ask = get_price(pair)
+    pips = calculate_pips(trade, bid, ask)
 
-            px = pricing.get(pair)
-            if not px:
-                continue
+    if pips < TRAILING_TRIGGER_PIPS:
+        return
 
-            if units > 0:
-                current = px["bid"]
-                pips_profit = (current - entry) / pip_size(pair)
-            else:
-                current = px["ask"]
-                pips_profit = (entry - current) / pip_size(pair)
+    current_price = bid if units > 0 else ask
+    existing_sl = trade.get("stopLossOrder")
+    existing_sl_price = None
 
-            log(f"{pair} pips in profit: {pips_profit}")
+    if existing_sl and existing_sl.get("price"):
+        existing_sl_price = float(existing_sl["price"])
 
-            if pips_profit >= BREAK_EVEN[pair] and trade_id not in managed_to_be:
-                be_payload = {
-                    "stopLoss": {
-                        "price": price_format(pair, entry)
-                    }
-                }
-
-                response = oanda_put(
-                    f"/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
-                    be_payload,
-                )
-                managed_to_be.add(trade_id)
-                log(f"{pair} moved to breakeven: {response}")
-
-            if pips_profit >= TRAIL_AFTER[pair]:
-                pip = pip_size(pair)
-
-                if units > 0:
-                    new_sl = current - (TRAIL_LOCK[pair] * pip)
-                else:
-                    new_sl = current + (TRAIL_LOCK[pair] * pip)
-
-                trail_payload = {
-                    "stopLoss": {
-                        "price": price_format(pair, new_sl)
-                    }
-                }
-
-                response = oanda_put(
-                    f"/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
-                    trail_payload,
-                )
-                log(f"{pair} trailing stop updated: {response}")
-
-        except Exception as e:
-            log(f"manage error: {e}")
+    if units > 0:
+        new_sl = current_price - (TRAILING_DISTANCE_PIPS * pip_size)
+        # only move SL upward
+        if existing_sl_price is None or new_sl > existing_sl_price:
+            update_trade_sl(trade_id, new_sl)
+            log(f"TRAILING SL UPDATED | pair={pair} trade_id={trade_id} new_sl={new_sl:.5f}")
+    else:
+        new_sl = current_price + (TRAILING_DISTANCE_PIPS * pip_size)
+        # only move SL downward for sell trades
+        if existing_sl_price is None or new_sl < existing_sl_price:
+            update_trade_sl(trade_id, new_sl)
+            log(f"TRAILING SL UPDATED | pair={pair} trade_id={trade_id} new_sl={new_sl:.5f}")
 
 
-def auto_loop() -> None:
+def monitor_trade(trade_id: str):
+    log(f"Started monitoring trade {trade_id}")
+
     while True:
         try:
-            manage_open_trades()
+            trade = get_trade_by_id(trade_id)
+
+            # FIXES GHOST TRACKING BUG
+            if not trade:
+                log(f"No open trade found for trade_id={trade_id}. Stopping monitor.")
+                active_monitors.pop(trade_id, None)
+                return
+
+            pair = trade["instrument"]
+            bid, ask = get_price(pair)
+            pips = calculate_pips(trade, bid, ask)
+            unrealized_pl = trade.get("unrealizedPL", "0.0")
+            entry_price = float(trade["price"])
+            current_units = float(trade["currentUnits"])
+            current_price = bid if current_units > 0 else ask
+
+            log(
+                f"MONITOR | pair={pair} trade_id={trade_id} "
+                f"entry={entry_price:.5f} current={current_price:.5f} "
+                f"pips={pips} unrealizedPL={unrealized_pl}"
+            )
+
+            maybe_trail_stop(trade)
+
+            time.sleep(MONITOR_INTERVAL)
+
         except Exception as e:
-            log(f"manage loop error: {e}")
-        time.sleep(AUTO_CHECK_SECONDS)
+            log(f"Monitor error for trade {trade_id}: {e}")
+            time.sleep(MONITOR_INTERVAL)
 
 
-# =========================================================
-# ROUTES
-# =========================================================
+def start_monitor_thread(trade_id: str):
+    if not trade_id:
+        return
+
+    if trade_id in active_monitors:
+        log(f"Monitor already running for trade_id={trade_id}")
+        return
+
+    thread = threading.Thread(target=monitor_trade, args=(trade_id,), daemon=True)
+    active_monitors[trade_id] = thread
+    thread.start()
+
+
+# =========================
+# WEBHOOK ROUTES
+# =========================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "bot": "OANDA Runner V11 Final",
-        "env": OANDA_ENV,
-        "pairs": PAIRS,
-        "trend_granularity": TREND_GRANULARITY,
-        "ema_period": EMA_PERIOD,
-        "momentum_lookback": MOMENTUM_LOOKBACK,
-        "breakout_lookback": BREAKOUT_LOOKBACK,
-        "max_total_open_trades": MAX_TOTAL_OPEN_TRADES,
         "status": "running",
-        "units": UNITS,
+        "env": OANDA_ENV,
+        "session_filter": ENABLE_SESSION_FILTER,
+        "risk_percent": RISK_PERCENT,
+        "sl_pips": STOP_LOSS_PIPS,
+        "tp_pips": TAKE_PROFIT_PIPS
     })
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = parse_webhook_payload()
-        signal = data.get("signal")
-        pair = data.get("pair")
-        result = place_trade(signal, pair)
-        return jsonify(result), 200
+        data = request.get_json(force=True, silent=False)
+
+        if not data:
+            return jsonify({"error": "No JSON received"}), 400
+
+        passphrase = str(data.get("passphrase", "")).strip()
+        if WEBHOOK_PASSPHRASE and passphrase != WEBHOOK_PASSPHRASE:
+            return jsonify({"error": "Invalid passphrase"}), 403
+
+        pair = str(data.get("pair", "")).strip().upper()
+        side = str(data.get("action", "")).strip().upper()
+
+        if not pair or side not in ["BUY", "SELL"]:
+            return jsonify({"error": "Invalid pair or action"}), 400
+
+        if "_" not in pair:
+            return jsonify({"error": "Pair must look like EUR_USD"}), 400
+
+        if not is_trading_session():
+            log(f"Blocked by session filter | pair={pair} action={side}")
+            return jsonify({"status": "blocked", "reason": "outside trading session"}), 200
+
+        if pair_recently_traded(pair):
+            log(f"Blocked duplicate signal too soon | pair={pair}")
+            return jsonify({"status": "blocked", "reason": "pair traded too recently"}), 200
+
+        existing_pair_trade = get_open_trade_for_pair(pair)
+        if existing_pair_trade:
+            log(f"Blocked duplicate open trade on same pair | pair={pair}")
+            return jsonify({"status": "blocked", "reason": "open trade already exists for pair"}), 200
+
+        if count_open_trades() >= MAX_OPEN_TRADES:
+            log(f"Blocked by max open trades | current={count_open_trades()} max={MAX_OPEN_TRADES}")
+            return jsonify({"status": "blocked", "reason": "max open trades reached"}), 200
+
+        if not ALLOW_MULTIPAIR and count_open_trades() > 0:
+            log("Blocked because multipair is disabled")
+            return jsonify({"status": "blocked", "reason": "multipair disabled"}), 200
+
+        order_result, trade_id = create_market_order(pair, side)
+        last_trade_time[pair] = time.time()
+
+        if trade_id:
+            start_monitor_thread(trade_id)
+
+        return jsonify({
+            "status": "success",
+            "pair": pair,
+            "action": side,
+            "trade_id": trade_id,
+            "order_result": order_result
+        }), 200
+
+    except requests.HTTPError as e:
+        try:
+            error_body = e.response.json()
+        except Exception:
+            error_body = e.response.text if e.response is not None else str(e)
+
+        log(f"OANDA HTTP ERROR: {error_body}")
+        return jsonify({"error": "OANDA HTTP error", "details": error_body}), 500
+
     except Exception as e:
-        log(f"Webhook error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
+        log(f"WEBHOOK ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
-# =========================================================
+@app.route("/open-trades", methods=["GET"])
+def open_trades():
+    try:
+        trades = get_open_trades()
+        return jsonify({"count": len(trades), "trades": trades}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/close-all", methods=["POST"])
+def close_all():
+    try:
+        trades = get_open_trades()
+        results = []
+
+        for trade in trades:
+            trade_id = str(trade["id"])
+            result = close_trade(trade_id)
+            results.append(result)
+            log(f"Closed trade {trade_id}")
+
+        return jsonify({"status": "success", "closed": len(results), "results": results}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================
 # START
-# =========================================================
-threading.Thread(target=auto_loop, daemon=True).start()
-
+# =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    missing = []
+    if not API_KEY:
+        missing.append("OANDA_API_KEY")
+    if not ACCOUNT_ID:
+        missing.append("OANDA_ACCOUNT_ID")
+
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+    port = int(os.getenv("PORT", "5000"))
+    log(f"Starting Forex Bot V12 on port {port} | env={OANDA_ENV}")
     app.run(host="0.0.0.0", port=port)
