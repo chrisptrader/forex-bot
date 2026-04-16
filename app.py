@@ -21,6 +21,9 @@ RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "20"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "50"))
 
+FIXED_UNITS = int(os.getenv("FIXED_UNITS", "1000"))
+FALLBACK_UNITS = int(os.getenv("FALLBACK_UNITS", "1000"))
+
 USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "true").strip().lower() == "true"
 TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "15"))
 TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "10"))
@@ -29,9 +32,11 @@ USE_BREAK_EVEN = os.getenv("USE_BREAK_EVEN", "true").strip().lower() == "true"
 BREAK_EVEN_TRIGGER_PIPS = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", "10"))
 BREAK_EVEN_PLUS_PIPS = float(os.getenv("BREAK_EVEN_PLUS_PIPS", "1"))
 
-ALLOW_MULTIPAIR = os.getenv("ALLOW_MULTIPAIR", "true").strip().lower() == "true"
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
-MIN_SECONDS_BETWEEN_TRADES = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "300"))
+ALLOW_MULTIPAIR = os.getenv("ALLOW_MULTIPAIR", "false").strip().lower() == "true"
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "1"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
+ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").strip().lower() == "true"
+MIN_SECONDS_BETWEEN_TRADES = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "900"))
 
 ENABLE_SESSION_FILTER = os.getenv("ENABLE_SESSION_FILTER", "true").strip().lower() == "true"
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", "America/New_York").strip()
@@ -54,8 +59,22 @@ MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2.0"))
 ENABLE_DAILY_LOSS_LIMIT = os.getenv("ENABLE_DAILY_LOSS_LIMIT", "true").strip().lower() == "true"
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
 
+# NEW V17 FILTERS
+ENABLE_MOMENTUM_FILTER = os.getenv("ENABLE_MOMENTUM_FILTER", "true").strip().lower() == "true"
+MOMENTUM_LOOKBACK_CANDLES = int(os.getenv("MOMENTUM_LOOKBACK_CANDLES", "5"))
+MAX_SAME_DIRECTION_CANDLES = int(os.getenv("MAX_SAME_DIRECTION_CANDLES", "3"))
+MAX_MOMENTUM_BURST_PIPS = float(os.getenv("MAX_MOMENTUM_BURST_PIPS", "12"))
+
+ENABLE_PULLBACK_FILTER = os.getenv("ENABLE_PULLBACK_FILTER", "true").strip().lower() == "true"
+PULLBACK_MIN_PIPS = float(os.getenv("PULLBACK_MIN_PIPS", "2"))
+
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "10"))
-FALLBACK_UNITS = int(os.getenv("FALLBACK_UNITS", "100"))
+
+ALLOWED_PAIRS = {
+    "EUR_USD",
+    "GBP_USD",
+    "USD_JPY",
+}
 
 if OANDA_ENV == "live":
     BASE_URL = "https://api-fxtrade.oanda.com"
@@ -70,6 +89,7 @@ HEADERS = {
 last_trade_time = {}
 active_monitors = {}
 daily_start_balance = {"date": None, "balance": None}
+daily_trade_counter = {"date": None, "count": 0}
 
 
 # =========================
@@ -77,6 +97,10 @@ daily_start_balance = {"date": None, "balance": None}
 # =========================
 def log(msg: str) -> None:
     print(f"[{datetime.utcnow().isoformat()} UTC] {msg}", flush=True)
+
+
+def today_str() -> str:
+    return datetime.now(ZoneInfo(TIMEZONE_NAME)).date().isoformat()
 
 
 def pip_size_for_pair(pair: str) -> float:
@@ -110,16 +134,34 @@ def get_account_details():
 
 
 def get_account_balance() -> float:
-    account = get_account_details()
-    return float(account.get("balance", 0.0))
+    return float(get_account_details().get("balance", 0.0))
 
 
 def refresh_daily_start_balance():
-    today = datetime.now(ZoneInfo(TIMEZONE_NAME)).date().isoformat()
+    today = today_str()
     if daily_start_balance["date"] != today:
         daily_start_balance["date"] = today
         daily_start_balance["balance"] = get_account_balance()
         log(f"New daily balance snapshot set: {daily_start_balance['balance']}")
+
+
+def refresh_daily_trade_counter():
+    today = today_str()
+    if daily_trade_counter["date"] != today:
+        daily_trade_counter["date"] = today
+        daily_trade_counter["count"] = 0
+        log("Daily trade counter reset")
+
+
+def increment_daily_trade_counter():
+    refresh_daily_trade_counter()
+    daily_trade_counter["count"] += 1
+    log(f"Daily trade count: {daily_trade_counter['count']}/{MAX_TRADES_PER_DAY}")
+
+
+def max_trades_per_day_hit() -> bool:
+    refresh_daily_trade_counter()
+    return daily_trade_counter["count"] >= MAX_TRADES_PER_DAY
 
 
 def daily_loss_limit_hit() -> bool:
@@ -189,16 +231,11 @@ def pair_recently_traded(pair: str) -> bool:
 
 def get_candles(pair: str, granularity: str = "M5", count: int = 60):
     url = f"{BASE_URL}/v3/instruments/{pair}/candles"
-    params = {
-        "price": "M",
-        "granularity": granularity,
-        "count": count
-    }
+    params = {"price": "M", "granularity": granularity, "count": count}
     r = requests.get(url, headers=HEADERS, params=params, timeout=20)
     r.raise_for_status()
     candles = r.json().get("candles", [])
-    closed = [c for c in candles if c.get("complete")]
-    return closed
+    return [c for c in candles if c.get("complete")]
 
 
 def simple_moving_average(values, period: int):
@@ -207,7 +244,7 @@ def simple_moving_average(values, period: int):
     return sum(values[-period:]) / period
 
 
-def trend_filter_pass(pair: str, side: str) -> tuple[bool, str]:
+def trend_filter_pass(pair: str, side: str):
     if not ENABLE_TREND_FILTER:
         return True, "trend filter off"
 
@@ -220,15 +257,18 @@ def trend_filter_pass(pair: str, side: str) -> tuple[bool, str]:
     if fast_ma is None or slow_ma is None:
         return False, "not enough candles for trend filter"
 
-    if side == "BUY" and fast_ma > slow_ma:
-        return True, f"BUY trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f}"
-    if side == "SELL" and fast_ma < slow_ma:
-        return True, f"SELL trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f}"
+    # stronger separation than before
+    ma_gap_pips = abs(fast_ma - slow_ma) / pip_size_for_pair(pair)
 
-    return False, f"trend blocked fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f}"
+    if side == "BUY" and fast_ma > slow_ma and ma_gap_pips >= 1.5:
+        return True, f"BUY trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
+    if side == "SELL" and fast_ma < slow_ma and ma_gap_pips >= 1.5:
+        return True, f"SELL trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
+
+    return False, f"trend blocked fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
 
 
-def volatility_filter_pass(pair: str) -> tuple[bool, str]:
+def volatility_filter_pass(pair: str):
     if not ENABLE_VOLATILITY_FILTER:
         return True, "volatility filter off"
 
@@ -249,7 +289,7 @@ def volatility_filter_pass(pair: str) -> tuple[bool, str]:
     return True, f"volatility pass range={range_pips:.1f} pips"
 
 
-def spread_filter_pass(pair: str) -> tuple[bool, str]:
+def spread_filter_pass(pair: str):
     if not ENABLE_SPREAD_FILTER:
         return True, "spread filter off"
     spread = get_spread_pips(pair)
@@ -258,21 +298,86 @@ def spread_filter_pass(pair: str) -> tuple[bool, str]:
     return True, f"spread pass spread={spread} pips"
 
 
+def momentum_filter_pass(pair: str, side: str):
+    if not ENABLE_MOMENTUM_FILTER:
+        return True, "momentum filter off"
+
+    count_needed = max(MOMENTUM_LOOKBACK_CANDLES + 1, 6)
+    candles = get_candles(pair, granularity="M5", count=count_needed)
+    if len(candles) < count_needed:
+        return False, "not enough candles for momentum filter"
+
+    recent = candles[-MOMENTUM_LOOKBACK_CANDLES:]
+    closes = [float(c["mid"]["c"]) for c in recent]
+    opens = [float(c["mid"]["o"]) for c in recent]
+    pip_size = pip_size_for_pair(pair)
+
+    bullish_count = 0
+    bearish_count = 0
+    for o, c in zip(opens, closes):
+        if c > o:
+            bullish_count += 1
+        elif c < o:
+            bearish_count += 1
+
+    burst_pips = abs(closes[-1] - closes[0]) / pip_size
+
+    # block shorts into strong bullish momentum
+    if side == "SELL" and bullish_count >= MAX_SAME_DIRECTION_CANDLES and burst_pips >= MAX_MOMENTUM_BURST_PIPS:
+        return False, f"strong bullish momentum blocked bullish_count={bullish_count} burst={burst_pips:.1f}"
+
+    # block buys into strong bearish momentum
+    if side == "BUY" and bearish_count >= MAX_SAME_DIRECTION_CANDLES and burst_pips >= MAX_MOMENTUM_BURST_PIPS:
+        return False, f"strong bearish momentum blocked bearish_count={bearish_count} burst={burst_pips:.1f}"
+
+    return True, f"momentum pass bullish_count={bullish_count} bearish_count={bearish_count} burst={burst_pips:.1f}"
+
+
+def pullback_filter_pass(pair: str, side: str):
+    if not ENABLE_PULLBACK_FILTER:
+        return True, "pullback filter off"
+
+    candles = get_candles(pair, granularity="M5", count=6)
+    if len(candles) < 4:
+        return False, "not enough candles for pullback filter"
+
+    pip_size = pip_size_for_pair(pair)
+    recent = candles[-4:]
+    closes = [float(c["mid"]["c"]) for c in recent]
+
+    # for BUY, avoid buying when price has not pulled back at all from recent high
+    if side == "BUY":
+        recent_high = max(closes[:-1])
+        last_close = closes[-1]
+        pullback = (recent_high - last_close) / pip_size
+        if pullback < PULLBACK_MIN_PIPS:
+            return False, f"buy blocked no pullback pullback={pullback:.1f}"
+
+    # for SELL, avoid selling when price has not bounced at all from recent low
+    if side == "SELL":
+        recent_low = min(closes[:-1])
+        last_close = closes[-1]
+        bounce = (last_close - recent_low) / pip_size
+        if bounce < PULLBACK_MIN_PIPS:
+            return False, f"sell blocked no bounce bounce={bounce:.1f}"
+
+    return True, "pullback pass"
+
+
 def calculate_units(pair: str, stop_loss_pips: float) -> int:
     try:
+        if FIXED_UNITS > 0:
+            return FIXED_UNITS
+
         balance = get_account_balance()
         risk_amount = balance * (RISK_PERCENT / 100.0)
-        pip_size = pip_size_for_pair(pair)
-        bid, ask = get_price(pair)
-        entry_price = ask
-        stop_distance_price = stop_loss_pips * pip_size
+        stop_distance_price = stop_loss_pips * pip_size_for_pair(pair)
 
         if stop_distance_price <= 0:
             return FALLBACK_UNITS
 
         raw_units = risk_amount / stop_distance_price
-        units = max(1, min(int(raw_units), 100000))
-        return units
+        return max(1, min(int(raw_units), 100000))
     except Exception as e:
         log(f"Risk sizing failed for {pair}, using fallback units. Error: {e}")
         return FALLBACK_UNITS
@@ -324,12 +429,8 @@ def create_market_order(pair: str, side: str):
             "units": str(units),
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": format_price(pair, sl_price)
-            },
-            "takeProfitOnFill": {
-                "price": format_price(pair, tp_price)
-            }
+            "stopLossOnFill": {"price": format_price(pair, sl_price)},
+            "takeProfitOnFill": {"price": format_price(pair, tp_price)}
         }
     }
 
@@ -348,6 +449,7 @@ def create_market_order(pair: str, side: str):
         f"SL={format_price(pair, sl_price)} TP={format_price(pair, tp_price)} "
         f"trade_id={trade_id}"
     )
+
     return data, str(trade_id) if trade_id else None
 
 
@@ -481,6 +583,8 @@ def filters_pass(pair: str, side: str):
         spread_filter_pass(pair),
         volatility_filter_pass(pair),
         trend_filter_pass(pair, side),
+        momentum_filter_pass(pair, side),
+        pullback_filter_pass(pair, side),
     ]
     for passed, reason in checks:
         log(f"FILTER | pair={pair} side={side} result={passed} reason={reason}")
@@ -497,15 +601,21 @@ def home():
     return jsonify({
         "status": "running",
         "env": OANDA_ENV,
-        "risk_percent": RISK_PERCENT,
+        "fixed_units": FIXED_UNITS,
+        "allowed_pairs": sorted(list(ALLOWED_PAIRS)),
         "sl_pips": STOP_LOSS_PIPS,
         "tp_pips": TAKE_PROFIT_PIPS,
         "session_filter": ENABLE_SESSION_FILTER,
         "trend_filter": ENABLE_TREND_FILTER,
         "volatility_filter": ENABLE_VOLATILITY_FILTER,
         "spread_filter": ENABLE_SPREAD_FILTER,
+        "momentum_filter": ENABLE_MOMENTUM_FILTER,
+        "pullback_filter": ENABLE_PULLBACK_FILTER,
         "break_even": USE_BREAK_EVEN,
-        "daily_loss_limit": ENABLE_DAILY_LOSS_LIMIT
+        "daily_loss_limit": ENABLE_DAILY_LOSS_LIMIT,
+        "max_open_trades": MAX_OPEN_TRADES,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "one_trade_per_pair": ONE_TRADE_PER_PAIR
     })
 
 
@@ -526,11 +636,15 @@ def webhook():
         if not pair or side not in ["BUY", "SELL"]:
             return jsonify({"error": "Invalid pair or action"}), 400
 
-        if "_" not in pair:
-            return jsonify({"error": "Pair must look like EUR_USD"}), 400
+        if pair not in ALLOWED_PAIRS:
+            log(f"Blocked unsupported pair | pair={pair}")
+            return jsonify({"status": "blocked", "reason": "unsupported pair"}), 200
 
         if daily_loss_limit_hit():
             return jsonify({"status": "blocked", "reason": "daily loss limit hit"}), 200
+
+        if max_trades_per_day_hit():
+            return jsonify({"status": "blocked", "reason": "max trades per day reached"}), 200
 
         if not is_trading_session():
             log(f"Blocked by session filter | pair={pair} action={side}")
@@ -540,10 +654,11 @@ def webhook():
             log(f"Blocked duplicate signal too soon | pair={pair}")
             return jsonify({"status": "blocked", "reason": "pair traded too recently"}), 200
 
-        existing_pair_trade = get_open_trade_for_pair(pair)
-        if existing_pair_trade:
-            log(f"Blocked duplicate open trade on same pair | pair={pair}")
-            return jsonify({"status": "blocked", "reason": "open trade already exists for pair"}), 200
+        if ONE_TRADE_PER_PAIR:
+            existing_pair_trade = get_open_trade_for_pair(pair)
+            if existing_pair_trade:
+                log(f"Blocked duplicate open trade on same pair | pair={pair}")
+                return jsonify({"status": "blocked", "reason": "open trade already exists for pair"}), 200
 
         current_open_trades = count_open_trades()
         if current_open_trades >= MAX_OPEN_TRADES:
@@ -558,8 +673,9 @@ def webhook():
         if not passed:
             return jsonify({"status": "blocked", "reason": reason}), 200
 
-        order_result, trade_id = create_market_order(pair, side)
+        _, trade_id = create_market_order(pair, side)
         last_trade_time[pair] = time.time()
+        increment_daily_trade_counter()
 
         if trade_id:
             start_monitor_thread(trade_id)
@@ -568,8 +684,7 @@ def webhook():
             "status": "success",
             "pair": pair,
             "action": side,
-            "trade_id": trade_id,
-            "order_result": order_result
+            "trade_id": trade_id
         }), 200
 
     except requests.HTTPError as e:
@@ -619,7 +734,8 @@ if __name__ == "__main__":
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
     refresh_daily_start_balance()
+    refresh_daily_trade_counter()
 
     port = int(os.getenv("PORT", "5000"))
-    log(f"Starting Forex Bot V13 on port {port} | env={OANDA_ENV}")
+    log(f"Starting Forex Bot V17 Momentum-Aware on port {port} | env={OANDA_ENV}")
     app.run(host="0.0.0.0", port=port)
