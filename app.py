@@ -763,4 +763,4 @@ if __name__ == "__main__":
     log(f"Starting Forex Bot V18 Smart Momentum on port {port} | env={OANDA_ENV}")
     app.run(host="0.0.0.0", port=port)
 
-Like this?
+Like 
