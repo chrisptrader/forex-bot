@@ -48,6 +48,8 @@ NY_END = int(os.getenv("NY_END", "11"))
 ENABLE_TREND_FILTER = os.getenv("ENABLE_TREND_FILTER", "true").strip().lower() == "true"
 FAST_MA_PERIOD = int(os.getenv("FAST_MA_PERIOD", "20"))
 SLOW_MA_PERIOD = int(os.getenv("SLOW_MA_PERIOD", "50"))
+MIN_TREND_GAP_PIPS = float(os.getenv("MIN_TREND_GAP_PIPS", "1.5"))
+STRONG_TREND_GAP_PIPS = float(os.getenv("STRONG_TREND_GAP_PIPS", "8"))
 
 ENABLE_VOLATILITY_FILTER = os.getenv("ENABLE_VOLATILITY_FILTER", "true").strip().lower() == "true"
 MIN_CANDLE_RANGE_PIPS = float(os.getenv("MIN_CANDLE_RANGE_PIPS", "5"))
@@ -59,11 +61,9 @@ MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2.0"))
 ENABLE_DAILY_LOSS_LIMIT = os.getenv("ENABLE_DAILY_LOSS_LIMIT", "true").strip().lower() == "true"
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
 
-# V18 MOMENTUM SETTINGS
 ENABLE_MOMENTUM_FILTER = os.getenv("ENABLE_MOMENTUM_FILTER", "true").strip().lower() == "true"
 MOMENTUM_CONFIRM_CANDLES = int(os.getenv("MOMENTUM_CONFIRM_CANDLES", "2"))
 MOMENTUM_MIN_BODY_PIPS = float(os.getenv("MOMENTUM_MIN_BODY_PIPS", "1.0"))
-STRONG_TREND_GAP_PIPS = float(os.getenv("STRONG_TREND_GAP_PIPS", "8"))
 
 ENABLE_PULLBACK_FILTER = os.getenv("ENABLE_PULLBACK_FILTER", "true").strip().lower() == "true"
 PULLBACK_MIN_PIPS = float(os.getenv("PULLBACK_MIN_PIPS", "2"))
@@ -83,7 +83,7 @@ else:
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
 last_trade_time = {}
@@ -244,24 +244,27 @@ def simple_moving_average(values, period: int):
     return sum(values[-period:]) / period
 
 
+def get_trend_values(pair: str):
+    candles = get_candles(pair, granularity="M5", count=max(SLOW_MA_PERIOD + 5, 60))
+    closes = [float(c["mid"]["c"]) for c in candles]
+    fast_ma = simple_moving_average(closes, FAST_MA_PERIOD)
+    slow_ma = simple_moving_average(closes, SLOW_MA_PERIOD)
+    return fast_ma, slow_ma
+
+
 def trend_filter_pass(pair: str, side: str):
     if not ENABLE_TREND_FILTER:
         return True, "trend filter off"
 
-    candles = get_candles(pair, granularity="M5", count=max(SLOW_MA_PERIOD + 5, 60))
-    closes = [float(c["mid"]["c"]) for c in candles]
-
-    fast_ma = simple_moving_average(closes, FAST_MA_PERIOD)
-    slow_ma = simple_moving_average(closes, SLOW_MA_PERIOD)
-
+    fast_ma, slow_ma = get_trend_values(pair)
     if fast_ma is None or slow_ma is None:
         return False, "not enough candles for trend filter"
 
     ma_gap_pips = abs(fast_ma - slow_ma) / pip_size_for_pair(pair)
 
-    if side == "BUY" and fast_ma > slow_ma and ma_gap_pips >= 1.5:
+    if side == "BUY" and fast_ma > slow_ma and ma_gap_pips >= MIN_TREND_GAP_PIPS:
         return True, f"BUY trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
-    if side == "SELL" and fast_ma < slow_ma and ma_gap_pips >= 1.5:
+    if side == "SELL" and fast_ma < slow_ma and ma_gap_pips >= MIN_TREND_GAP_PIPS:
         return True, f"SELL trend pass fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
 
     return False, f"trend blocked fast_ma={fast_ma:.5f} slow_ma={slow_ma:.5f} gap={ma_gap_pips:.1f}"
@@ -321,33 +324,28 @@ def momentum_filter_pass(pair: str, side: str):
     pip_size = pip_size_for_pair(pair)
 
     confirm_count = 0
-    for c in recent:
-        o = float(c["mid"]["o"])
-        cl = float(c["mid"]["c"])
-        body_pips = abs(cl - o) / pip_size
+    for candle in recent:
+        open_price = float(candle["mid"]["o"])
+        close_price = float(candle["mid"]["c"])
+        body_pips = abs(close_price - open_price) / pip_size
 
-        if side == "BUY" and cl > o and body_pips >= MOMENTUM_MIN_BODY_PIPS:
+        if side == "BUY" and close_price > open_price and body_pips >= MOMENTUM_MIN_BODY_PIPS:
             confirm_count += 1
-        elif side == "SELL" and cl < o and body_pips >= MOMENTUM_MIN_BODY_PIPS:
+        elif side == "SELL" and close_price < open_price and body_pips >= MOMENTUM_MIN_BODY_PIPS:
             confirm_count += 1
 
     if confirm_count >= MOMENTUM_CONFIRM_CANDLES:
         return True, f"{side} momentum pass candles={confirm_count}/{MOMENTUM_CONFIRM_CANDLES}"
 
-    # fallback: allow strong-trend entries if latest candle still supports direction
-    trend_candles = get_candles(pair, granularity="M5", count=max(SLOW_MA_PERIOD + 5, 60))
-    closes = [float(c["mid"]["c"]) for c in trend_candles]
-    fast_ma = simple_moving_average(closes, FAST_MA_PERIOD)
-    slow_ma = simple_moving_average(closes, SLOW_MA_PERIOD)
-
+    fast_ma, slow_ma = get_trend_values(pair)
     if fast_ma is not None and slow_ma is not None:
-        last = recent[-1]
-        lo = float(last["mid"]["o"])
-        lc = float(last["mid"]["c"])
+        last_candle = recent[-1]
+        last_open = float(last_candle["mid"]["o"])
+        last_close = float(last_candle["mid"]["c"])
 
         direction_ok = (
-            (side == "BUY" and lc > lo) or
-            (side == "SELL" and lc < lo)
+            (side == "BUY" and last_close > last_open)
+            or (side == "SELL" and last_close < last_open)
         )
 
         if direction_ok:
@@ -418,7 +416,7 @@ def update_trade_sl(trade_id: str, new_sl_price: float, pair: str):
     payload = {
         "stopLoss": {
             "timeInForce": "GTC",
-            "price": format_price(pair, new_sl_price)
+            "price": format_price(pair, new_sl_price),
         }
     }
     r = requests.put(url, headers=HEADERS, json=payload, timeout=20)
@@ -453,7 +451,7 @@ def create_market_order(pair: str, side: str):
             "timeInForce": "FOK",
             "positionFill": "DEFAULT",
             "stopLossOnFill": {"price": format_price(pair, sl_price)},
-            "takeProfitOnFill": {"price": format_price(pair, tp_price)}
+            "takeProfitOnFill": {"price": format_price(pair, tp_price)},
         }
     }
 
@@ -596,9 +594,9 @@ def start_monitor_thread(trade_id: str):
     if trade_id in active_monitors:
         log(f"Monitor already running for trade_id={trade_id}")
         return
-    t = threading.Thread(target=monitor_trade, args=(trade_id,), daemon=True)
-    active_monitors[trade_id] = t
-    t.start()
+    thread = threading.Thread(target=monitor_trade, args=(trade_id,), daemon=True)
+    active_monitors[trade_id] = thread
+    thread.start()
 
 
 def filters_pass(pair: str, side: str):
@@ -609,10 +607,12 @@ def filters_pass(pair: str, side: str):
         momentum_filter_pass(pair, side),
         pullback_filter_pass(pair, side),
     ]
+
     for passed, reason in checks:
         log(f"FILTER | pair={pair} side={side} result={passed} reason={reason}")
         if not passed:
             return False, reason
+
     return True, "all filters passed"
 
 
@@ -638,7 +638,7 @@ def home():
         "daily_loss_limit": ENABLE_DAILY_LOSS_LIMIT,
         "max_open_trades": MAX_OPEN_TRADES,
         "max_trades_per_day": MAX_TRADES_PER_DAY,
-        "one_trade_per_pair": ONE_TRADE_PER_PAIR
+        "one_trade_per_pair": ONE_TRADE_PER_PAIR,
     })
 
 
@@ -707,7 +707,7 @@ def webhook():
             "status": "success",
             "pair": pair,
             "action": side,
-            "trade_id": trade_id
+            "trade_id": trade_id,
         }), 200
 
     except requests.HTTPError as e:
@@ -762,5 +762,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     log(f"Starting Forex Bot V18 Smart Momentum on port {port} | env={OANDA_ENV}")
     app.run(host="0.0.0.0", port=port)
-
-Like 
