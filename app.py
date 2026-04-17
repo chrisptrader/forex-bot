@@ -59,11 +59,11 @@ MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "2.0"))
 ENABLE_DAILY_LOSS_LIMIT = os.getenv("ENABLE_DAILY_LOSS_LIMIT", "true").strip().lower() == "true"
 MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
 
-# NEW V17 FILTERS
+# V18 MOMENTUM SETTINGS
 ENABLE_MOMENTUM_FILTER = os.getenv("ENABLE_MOMENTUM_FILTER", "true").strip().lower() == "true"
-MOMENTUM_LOOKBACK_CANDLES = int(os.getenv("MOMENTUM_LOOKBACK_CANDLES", "5"))
-MAX_SAME_DIRECTION_CANDLES = int(os.getenv("MAX_SAME_DIRECTION_CANDLES", "3"))
-MAX_MOMENTUM_BURST_PIPS = float(os.getenv("MAX_MOMENTUM_BURST_PIPS", "12"))
+MOMENTUM_CONFIRM_CANDLES = int(os.getenv("MOMENTUM_CONFIRM_CANDLES", "2"))
+MOMENTUM_MIN_BODY_PIPS = float(os.getenv("MOMENTUM_MIN_BODY_PIPS", "1.0"))
+STRONG_TREND_GAP_PIPS = float(os.getenv("STRONG_TREND_GAP_PIPS", "8"))
 
 ENABLE_PULLBACK_FILTER = os.getenv("ENABLE_PULLBACK_FILTER", "true").strip().lower() == "true"
 PULLBACK_MIN_PIPS = float(os.getenv("PULLBACK_MIN_PIPS", "2"))
@@ -257,7 +257,6 @@ def trend_filter_pass(pair: str, side: str):
     if fast_ma is None or slow_ma is None:
         return False, "not enough candles for trend filter"
 
-    # stronger separation than before
     ma_gap_pips = abs(fast_ma - slow_ma) / pip_size_for_pair(pair)
 
     if side == "BUY" and fast_ma > slow_ma and ma_gap_pips >= 1.5:
@@ -298,39 +297,65 @@ def spread_filter_pass(pair: str):
     return True, f"spread pass spread={spread} pips"
 
 
+def strong_trend_override(side: str, fast_ma: float, slow_ma: float, pair: str):
+    gap_pips = abs(fast_ma - slow_ma) / pip_size_for_pair(pair)
+
+    if side == "BUY" and fast_ma > slow_ma and gap_pips >= STRONG_TREND_GAP_PIPS:
+        return True, f"strong BUY trend override gap={gap_pips:.1f}"
+    if side == "SELL" and fast_ma < slow_ma and gap_pips >= STRONG_TREND_GAP_PIPS:
+        return True, f"strong SELL trend override gap={gap_pips:.1f}"
+
+    return False, f"trend override failed gap={gap_pips:.1f}"
+
+
 def momentum_filter_pass(pair: str, side: str):
     if not ENABLE_MOMENTUM_FILTER:
         return True, "momentum filter off"
 
-    count_needed = max(MOMENTUM_LOOKBACK_CANDLES + 1, 6)
+    count_needed = max(MOMENTUM_CONFIRM_CANDLES + 2, 6)
     candles = get_candles(pair, granularity="M5", count=count_needed)
     if len(candles) < count_needed:
         return False, "not enough candles for momentum filter"
 
-    recent = candles[-MOMENTUM_LOOKBACK_CANDLES:]
-    closes = [float(c["mid"]["c"]) for c in recent]
-    opens = [float(c["mid"]["o"]) for c in recent]
+    recent = candles[-MOMENTUM_CONFIRM_CANDLES:]
     pip_size = pip_size_for_pair(pair)
 
-    bullish_count = 0
-    bearish_count = 0
-    for o, c in zip(opens, closes):
-        if c > o:
-            bullish_count += 1
-        elif c < o:
-            bearish_count += 1
+    confirm_count = 0
+    for c in recent:
+        o = float(c["mid"]["o"])
+        cl = float(c["mid"]["c"])
+        body_pips = abs(cl - o) / pip_size
 
-    burst_pips = abs(closes[-1] - closes[0]) / pip_size
+        if side == "BUY" and cl > o and body_pips >= MOMENTUM_MIN_BODY_PIPS:
+            confirm_count += 1
+        elif side == "SELL" and cl < o and body_pips >= MOMENTUM_MIN_BODY_PIPS:
+            confirm_count += 1
 
-    # block shorts into strong bullish momentum
-    if side == "SELL" and bullish_count >= MAX_SAME_DIRECTION_CANDLES and burst_pips >= MAX_MOMENTUM_BURST_PIPS:
-        return False, f"strong bullish momentum blocked bullish_count={bullish_count} burst={burst_pips:.1f}"
+    if confirm_count >= MOMENTUM_CONFIRM_CANDLES:
+        return True, f"{side} momentum pass candles={confirm_count}/{MOMENTUM_CONFIRM_CANDLES}"
 
-    # block buys into strong bearish momentum
-    if side == "BUY" and bearish_count >= MAX_SAME_DIRECTION_CANDLES and burst_pips >= MAX_MOMENTUM_BURST_PIPS:
-        return False, f"strong bearish momentum blocked bearish_count={bearish_count} burst={burst_pips:.1f}"
+    # fallback: allow strong-trend entries if latest candle still supports direction
+    trend_candles = get_candles(pair, granularity="M5", count=max(SLOW_MA_PERIOD + 5, 60))
+    closes = [float(c["mid"]["c"]) for c in trend_candles]
+    fast_ma = simple_moving_average(closes, FAST_MA_PERIOD)
+    slow_ma = simple_moving_average(closes, SLOW_MA_PERIOD)
 
-    return True, f"momentum pass bullish_count={bullish_count} bearish_count={bearish_count} burst={burst_pips:.1f}"
+    if fast_ma is not None and slow_ma is not None:
+        last = recent[-1]
+        lo = float(last["mid"]["o"])
+        lc = float(last["mid"]["c"])
+
+        direction_ok = (
+            (side == "BUY" and lc > lo) or
+            (side == "SELL" and lc < lo)
+        )
+
+        if direction_ok:
+            override_ok, override_reason = strong_trend_override(side, fast_ma, slow_ma, pair)
+            if override_ok:
+                return True, override_reason
+
+    return False, "not enough candles for momentum filter"
 
 
 def pullback_filter_pass(pair: str, side: str):
@@ -345,7 +370,6 @@ def pullback_filter_pass(pair: str, side: str):
     recent = candles[-4:]
     closes = [float(c["mid"]["c"]) for c in recent]
 
-    # for BUY, avoid buying when price has not pulled back at all from recent high
     if side == "BUY":
         recent_high = max(closes[:-1])
         last_close = closes[-1]
@@ -353,7 +377,6 @@ def pullback_filter_pass(pair: str, side: str):
         if pullback < PULLBACK_MIN_PIPS:
             return False, f"buy blocked no pullback pullback={pullback:.1f}"
 
-    # for SELL, avoid selling when price has not bounced at all from recent low
     if side == "SELL":
         recent_low = min(closes[:-1])
         last_close = closes[-1]
@@ -737,5 +760,7 @@ if __name__ == "__main__":
     refresh_daily_trade_counter()
 
     port = int(os.getenv("PORT", "5000"))
-    log(f"Starting Forex Bot V17 Momentum-Aware on port {port} | env={OANDA_ENV}")
+    log(f"Starting Forex Bot V18 Smart Momentum on port {port} | env={OANDA_ENV}")
     app.run(host="0.0.0.0", port=port)
+
+Like this?
