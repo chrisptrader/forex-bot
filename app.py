@@ -193,4 +193,4 @@ def get_prices(pair):
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
     r = requests.get(url, headers=HEADERS, params={"instruments": pair}, timeout=15)
     r.raise_for_status()
-    prices = r.json().
+    prices = r.json()
