@@ -1,16 +1,16 @@
 import os
 import time
+import math
 import logging
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests
 from flask import Flask, request, jsonify
+import requests
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
 
 # =========================
 # ENV HELPERS
@@ -39,7 +39,7 @@ def env_bool(name, default=False):
 
 
 # =========================
-# ENV CONFIG
+# CONFIG
 # =========================
 OANDA_API_KEY = env_str("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = env_str("OANDA_ACCOUNT_ID")
@@ -54,6 +54,9 @@ FALLBACK_UNITS = env_int("FALLBACK_UNITS", 100)
 
 STOP_LOSS_PIPS = env_float("STOP_LOSS_PIPS", 20)
 TAKE_PROFIT_PIPS = env_float("TAKE_PROFIT_PIPS", 80)
+DEFAULT_SL_PIPS = env_float("DEFAULT_SL_PIPS", STOP_LOSS_PIPS)
+DEFAULT_TP_PIPS = env_float("DEFAULT_TP_PIPS", TAKE_PROFIT_PIPS)
+
 MAX_SPREAD_PIPS = env_float("MAX_SPREAD_PIPS", 12)
 
 ENABLE_SPREAD_FILTER = env_bool("ENABLE_SPREAD_FILTER", True)
@@ -118,9 +121,6 @@ LONDON_END = env_int("LONDON_END", 11)
 NY_START = env_int("NY_START", 8)
 NY_END = env_int("NY_END", 11)
 
-DEFAULT_SL_PIPS = env_float("DEFAULT_SL_PIPS", STOP_LOSS_PIPS)
-DEFAULT_TP_PIPS = env_float("DEFAULT_TP_PIPS", TAKE_PROFIT_PIPS)
-
 if OANDA_ENV == "live":
     BASE_URL = "https://api-fxtrade.oanda.com"
 else:
@@ -128,21 +128,20 @@ else:
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json",
+    "Content-Type": "application/json"
 }
 
+REQUEST_TIMEOUT = 5
 
-# =========================
-# GLOBAL STATE
-# =========================
 last_trade_time = {}
 daily_start_balance = None
 daily_balance_date = None
 manager_started = False
+manager_lock = threading.Lock()
 
 
 # =========================
-# SMALL HELPERS
+# BASIC HELPERS
 # =========================
 def pip_size(pair):
     return 0.01 if "JPY" in pair else 0.0001
@@ -152,23 +151,20 @@ def now_est():
     return datetime.now(ZoneInfo(TIMEZONE_NAME))
 
 
-def safe_float(v, default=0.0):
+def in_session():
+    if not ENABLE_SESSION_FILTER:
+        return True
+    h = now_est().hour
+    london = LONDON_START <= h <= LONDON_END
+    ny = NY_START <= h <= NY_END
+    return london or ny
+
+
+def safe_json(response):
     try:
-        return float(v)
+        return response.json()
     except Exception:
-        return default
-
-
-def price_to_pips(pair, price_diff):
-    return price_diff / pip_size(pair)
-
-
-def pips_to_price(pair, pips):
-    return pips * pip_size(pair)
-
-
-def log_filter(pair, side, result, reason):
-    logging.info(f"FILTER | pair={pair} side={side} result={result} reason={reason}")
+        return {}
 
 
 # =========================
@@ -176,7 +172,7 @@ def log_filter(pair, side, result, reason):
 # =========================
 def get_account_summary():
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -186,99 +182,15 @@ def get_balance():
     return float(data["account"]["balance"])
 
 
-def get_nav():
-    data = get_account_summary()
-    account = data["account"]
-    return float(account.get("NAV", account.get("balance", 0)))
-
-
-def get_open_trades():
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.json().get("trades", [])
-
-
-def get_prices(pair):
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    r = requests.get(url, headers=HEADERS, params={"instruments": pair}, timeout=20)
-    r.raise_for_status()
-    prices = r.json()
-    return prices.get("prices", [])
-
-
-def get_bid_ask(pair):
-    prices = get_prices(pair)
-    if not prices:
-        raise ValueError(f"No price returned for {pair}")
-
-    p = prices[0]
-    bid = float(p["bids"][0]["price"])
-    ask = float(p["asks"][0]["price"])
-    return bid, ask
-
-
-def get_spread_pips(pair):
-    bid, ask = get_bid_ask(pair)
-    return price_to_pips(pair, ask - bid)
-
-
-def get_candles(pair, count=60, granularity="M2"):
-    url = f"{BASE_URL}/v3/instruments/{pair}/candles"
-    params = {
-        "count": count,
-        "price": "M",
-        "granularity": granularity,
-    }
-    r = requests.get(url, headers=HEADERS, params=params, timeout=20)
-    r.raise_for_status()
-    candles = r.json().get("candles", [])
-    cleaned = []
-
-    for c in candles:
-        if not c.get("complete", False):
-            continue
-        mid = c["mid"]
-        cleaned.append({
-            "time": c["time"],
-            "open": float(mid["o"]),
-            "high": float(mid["h"]),
-            "low": float(mid["l"]),
-            "close": float(mid["c"]),
-        })
-
-    return cleaned
-
-
-def close_trade(trade_id):
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
-    r = requests.put(url, headers=HEADERS, json={}, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def replace_trade_sl(trade_id, price):
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders"
-    payload = {
-        "stopLoss": {
-            "price": f"{price:.5f}" if price < 20 else f"{price:.3f}",
-            "timeInForce": "GTC"
-        }
-    }
-    r = requests.put(url, headers=HEADERS, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-# =========================
-# ACCOUNT RISK / LIMITS
-# =========================
 def reset_daily_balance_if_needed():
     global daily_start_balance, daily_balance_date
     today = now_est().date()
     if daily_balance_date != today:
         daily_balance_date = today
-        daily_start_balance = get_balance()
+        try:
+            daily_start_balance = get_balance()
+        except Exception as e:
+            logging.warning(f"Could not reset daily balance: {e}")
 
 
 def daily_loss_limit_hit():
@@ -286,414 +198,457 @@ def daily_loss_limit_hit():
         return False
 
     reset_daily_balance_if_needed()
-    bal = get_balance()
 
-    if not daily_start_balance:
+    if daily_start_balance in (None, 0):
         return False
 
-    dd = ((daily_start_balance - bal) / daily_start_balance) * 100
-    logging.info(f"DAILY LOSS CHECK | start={daily_start_balance:.2f} current={bal:.2f} dd={dd:.2f}%")
-    return dd >= MAX_DAILY_LOSS_PERCENT
+    try:
+        bal = get_balance()
+        dd = ((daily_start_balance - bal) / daily_start_balance) * 100
+        return dd >= MAX_DAILY_LOSS_PERCENT
+    except Exception as e:
+        logging.warning(f"Daily loss check failed: {e}")
+        return False
+
+
+def get_open_trades():
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("trades", [])
 
 
 def count_open_trades(pair=None):
-    trades = get_open_trades()
-    if pair:
-        return sum(1 for t in trades if t["instrument"] == pair)
-    return len(trades)
+    try:
+        trades = get_open_trades()
+        if pair:
+            return sum(1 for t in trades if t.get("instrument") == pair)
+        return len(trades)
+    except Exception as e:
+        logging.warning(f"count_open_trades failed: {e}")
+        return 999999
 
 
-def can_trade_pair(pair):
-    if not ALLOW_MULTIPAIR and count_open_trades() > 0:
-        log_filter(pair, "ANY", False, "multipair disabled")
-        return False
-
-    if count_open_trades() >= MAX_TOTAL_OPEN_TRADES:
-        log_filter(pair, "ANY", False, "max total open trades")
-        return False
-
-    if count_open_trades(pair) >= MAX_OPEN_TRADES:
-        log_filter(pair, "ANY", False, "max pair open trades")
-        return False
-
-    last_ts = last_trade_time.get(pair, 0)
-    if time.time() - last_ts < MIN_SECONDS_BETWEEN_TRADES:
-        log_filter(pair, "ANY", False, "cooldown active")
-        return False
-
-    if daily_loss_limit_hit():
-        log_filter(pair, "ANY", False, "daily loss limit hit")
-        return False
-
-    return True
+def get_prices(pair):
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    r = requests.get(url, headers=HEADERS, params={"instruments": pair}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    prices = data.get("prices", [])
+    if not prices:
+        raise Exception(f"No prices returned for {pair}")
+    return prices[0]
 
 
-# =========================
-# SIGNAL FILTERS
-# =========================
-def in_session():
-    if not ENABLE_SESSION_FILTER:
-        return True
-
-    h = now_est().hour
-    london = LONDON_START <= h <= LONDON_END
-    ny = NY_START <= h <= NY_END
-    return london or ny
+def get_bid_ask(pair):
+    p = get_prices(pair)
+    bid = float(p["bids"][0]["price"])
+    ask = float(p["asks"][0]["price"])
+    return bid, ask
 
 
-def candle_range_pips(pair, candle):
-    return price_to_pips(pair, candle["high"] - candle["low"])
+def get_spread_pips(pair):
+    bid, ask = get_bid_ask(pair)
+    return (ask - bid) / pip_size(pair)
 
 
-def candle_body_pips(pair, candle):
-    return price_to_pips(pair, abs(candle["close"] - candle["open"]))
+def get_candles(pair, count=60, granularity="M1"):
+    url = f"{BASE_URL}/v3/instruments/{pair}/candles"
+    params = {
+        "count": count,
+        "granularity": granularity,
+        "price": "M"
+    }
+    r = requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    candles = r.json().get("candles", [])
+    return [c for c in candles if c.get("complete")]
 
 
-def simple_sma(values, period):
+def price_from_candle(c):
+    return float(c["mid"]["c"])
+
+
+def high_from_candle(c):
+    return float(c["mid"]["h"])
+
+
+def low_from_candle(c):
+    return float(c["mid"]["l"])
+
+
+def open_from_candle(c):
+    return float(c["mid"]["o"])
+
+
+def body_pips(c, pair):
+    return abs(price_from_candle(c) - open_from_candle(c)) / pip_size(pair)
+
+
+def range_pips(c, pair):
+    return abs(high_from_candle(c) - low_from_candle(c)) / pip_size(pair)
+
+
+def sma(values, period):
     if len(values) < period or period <= 0:
         return None
     return sum(values[-period:]) / period
 
 
-def trend_ok(pair, side, candles):
-    if not ENABLE_TREND_FILTER:
-        log_filter(pair, side, True, "trend filter off")
+def ema(values, period):
+    if len(values) < period or period <= 0:
+        return None
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = (v * k) + (e * (1 - k))
+    return e
+
+
+def get_trade_price_now(pair, side):
+    bid, ask = get_bid_ask(pair)
+    return ask if side == "buy" else bid
+
+
+def units_for_pair(pair):
+    return FIXED_UNITS if FIXED_UNITS > 0 else FALLBACK_UNITS
+
+
+def trade_exists_on_pair(pair):
+    try:
+        return count_open_trades(pair) > 0
+    except Exception:
         return True
 
-    closes = [c["close"] for c in candles]
-    fast = simple_sma(closes, FAST_MA_PERIOD)
-    slow = simple_sma(closes, SLOW_MA_PERIOD)
 
-    if fast is None or slow is None:
-        log_filter(pair, side, False, "not enough candles for trend")
-        return False
+def can_trade_pair(pair):
+    now_ts = time.time()
 
-    gap_pips = price_to_pips(pair, abs(fast - slow))
-
-    if gap_pips < MIN_TREND_GAP_PIPS:
-        log_filter(pair, side, False, f"trend gap too small={gap_pips:.1f}")
-        return False
-
-    if side == "BUY" and fast <= slow:
-        log_filter(pair, side, False, "buy trend fail")
-        return False
-
-    if side == "SELL" and fast >= slow:
-        log_filter(pair, side, False, "sell trend fail")
-        return False
-
-    log_filter(pair, side, True, f"trend pass gap={gap_pips:.1f}")
-    return True
-
-
-def momentum_ok(pair, side, candles):
-    if not ENABLE_MOMENTUM_FILTER:
-        log_filter(pair, side, True, "momentum filter off")
-        return True
-
-    recent = candles[-MOMENTUM_CANDLES:]
-    if len(recent) < MOMENTUM_CANDLES:
-        log_filter(pair, side, False, "not enough candles for momentum")
-        return False
-
-    for c in recent:
-        body = candle_body_pips(pair, c)
-        if body < MOMENTUM_MIN_BODY_PIPS:
-            log_filter(pair, side, False, f"body too small={body:.1f}")
-            return False
-
-        if side == "BUY" and c["close"] <= c["open"]:
-            log_filter(pair, side, False, "buy momentum candle not bullish")
-            return False
-
-        if side == "SELL" and c["close"] >= c["open"]:
-            log_filter(pair, side, False, "sell momentum candle not bearish")
-            return False
-
-    log_filter(pair, side, True, "momentum pass")
-    return True
-
-
-def volatility_ok(pair, side, candles):
-    if not ENABLE_VOLATILITY_FILTER:
-        log_filter(pair, side, True, "volatility filter off")
-        return True
-
-    recent = candles[-BREAKOUT_LOOKBACK:]
-    if len(recent) < BREAKOUT_LOOKBACK:
-        log_filter(pair, side, False, "not enough candles for volatility")
-        return False
-
-    avg_range = sum(candle_range_pips(pair, c) for c in recent) / len(recent)
-    if avg_range < MIN_VOLATILITY_PIPS:
-        log_filter(pair, side, False, f"volatility too low={avg_range:.1f}")
-        return False
-
-    log_filter(pair, side, True, f"volatility pass={avg_range:.1f}")
-    return True
-
-
-def candle_range_ok(pair, side, candles):
-    if not candles:
-        log_filter(pair, side, False, "no candles")
-        return False
-
-    last = candles[-1]
-    rng = candle_range_pips(pair, last)
-
-    if rng < MIN_CANDLE_RANGE_PIPS:
-        log_filter(pair, side, False, f"candle range too small={rng:.1f}")
-        return False
-
-    if rng > MAX_CANDLE_RANGE_PIPS:
-        log_filter(pair, side, False, f"candle range too large={rng:.1f}")
-        return False
-
-    log_filter(pair, side, True, f"candle range pass={rng:.1f}")
-    return True
-
-
-def spread_ok(pair, side):
-    if not ENABLE_SPREAD_FILTER:
-        log_filter(pair, side, True, "spread filter off")
-        return True
-
-    spread = get_spread_pips(pair)
-    if spread > MAX_SPREAD_PIPS:
-        log_filter(pair, side, False, f"spread too high={spread:.1f}")
-        return False
-
-    log_filter(pair, side, True, f"spread pass spread={spread:.1f}")
-    return True
-
-
-def breakout_pullback_ok(pair, side, candles):
-    if len(candles) < BREAKOUT_LOOKBACK + 2:
-        log_filter(pair, side, False, "not enough candles for structure")
-        return False
-
-    lookback = candles[-(BREAKOUT_LOOKBACK + 1):-1]
-    last = candles[-1]
-    ph = max(c["high"] for c in lookback)
-    pl = min(c["low"] for c in lookback)
-
-    if side == "BUY":
-        pullback = price_to_pips(pair, ph - last["close"])
-        if last["close"] >= ph or pullback <= BUY_PULLBACK_PIPS:
-            log_filter(pair, side, True, f"buy structure pass ph={ph:.5f} pullback={pullback:.1f}")
-            return True
-        log_filter(pair, side, False, f"buy pullback fail ph={ph:.5f} pullback={pullback:.1f}")
-        return False
-
-    bounce = price_to_pips(pair, last["close"] - pl)
-    if last["close"] <= pl or bounce <= SELL_BOUNCE_PIPS:
-        log_filter(pair, side, True, f"sell structure pass pl={pl:.5f} bounce={bounce:.1f}")
-        return True
-    log_filter(pair, side, False, f"sell bounce fail pl={pl:.5f} bounce={bounce:.1f}")
-    return False
-
-
-def all_filters_pass(pair, side):
-    if pair not in PAIR_LIST:
-        log_filter(pair, side, False, "pair not enabled")
-        return False, "pair not enabled"
+    if daily_loss_limit_hit():
+        return False, "daily loss limit hit"
 
     if not in_session():
-        log_filter(pair, side, False, "session blocked")
-        return False, "session blocked"
+        return False, "outside session"
 
-    if not can_trade_pair(pair):
-        return False, "trade limits blocked"
+    last_ts = last_trade_time.get(pair, 0)
+    if now_ts - last_ts < max(MIN_SECONDS_BETWEEN_TRADES, TRADE_COOLDOWN):
+        return False, "pair cooldown active"
 
-    candles = get_candles(pair, count=max(80, SLOW_MA_PERIOD + 5), granularity="M2")
+    total_open = count_open_trades()
+    if total_open >= MAX_TOTAL_OPEN_TRADES:
+        return False, "max total open trades reached"
 
-    checks = [
-        spread_ok(pair, side),
-        candle_range_ok(pair, side, candles),
-        trend_ok(pair, side, candles),
-        momentum_ok(pair, side, candles),
-        volatility_ok(pair, side, candles),
-        breakout_pullback_ok(pair, side, candles),
-    ]
+    pair_open = count_open_trades(pair)
+    if pair_open >= MAX_OPEN_TRADES:
+        return False, "max open trades on pair reached"
 
-    if all(checks):
-        return True, "all filters passed"
+    if not ALLOW_MULTIPAIR:
+        if total_open > 0 and pair_open == 0:
+            return False, "multipair disabled"
 
-    return False, "one or more filters failed"
+    return True, "ok"
 
 
-# =========================
-# ORDER LOGIC
-# =========================
-def compute_units(pair):
-    # For now keep it simple and stable
-    if FIXED_UNITS > 0:
-        return FIXED_UNITS
-    if FALLBACK_UNITS > 0:
-        return FALLBACK_UNITS
-    return 100
+def place_market_order(pair, side, units, sl_pips, tp_pips):
+    price_now = get_trade_price_now(pair, side)
+    ps = pip_size(pair)
 
-
-def place_market_order(pair, side, units=None, sl_pips=None, tp_pips=None):
-    side = side.upper().strip()
-
-    if side not in ["BUY", "SELL"]:
-        raise ValueError("side must be BUY or SELL")
-
-    if units is None:
-        units = compute_units(pair)
-
-    sl_pips = safe_float(sl_pips, DEFAULT_SL_PIPS)
-    tp_pips = safe_float(tp_pips, DEFAULT_TP_PIPS)
-
-    bid, ask = get_bid_ask(pair)
-    entry = ask if side == "BUY" else bid
-    pip = pip_size(pair)
-
-    if side == "BUY":
-        sl_price = entry - (sl_pips * pip)
-        tp_price = entry + (tp_pips * pip)
-        signed_units = units
+    if side == "buy":
+        sl_price = round(price_now - (sl_pips * ps), 5 if ps == 0.0001 else 3)
+        tp_price = round(price_now + (tp_pips * ps), 5 if ps == 0.0001 else 3)
+        order_units = abs(units)
     else:
-        sl_price = entry + (sl_pips * pip)
-        tp_price = entry - (tp_pips * pip)
-        signed_units = -units
+        sl_price = round(price_now + (sl_pips * ps), 5 if ps == 0.0001 else 3)
+        tp_price = round(price_now - (tp_pips * ps), 5 if ps == 0.0001 else 3)
+        order_units = -abs(units)
 
-    price_fmt = "{:.3f}" if "JPY" in pair else "{:.5f}"
-
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     payload = {
         "order": {
-            "instrument": pair,
-            "units": str(signed_units),
             "type": "MARKET",
+            "instrument": pair,
+            "units": str(order_units),
+            "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {
-                "price": price_fmt.format(sl_price),
-                "timeInForce": "GTC",
-                "triggerMode": "TOP_OF_BOOK",
-            },
             "takeProfitOnFill": {
-                "price": price_fmt.format(tp_price),
-                "timeInForce": "GTC",
+                "price": str(tp_price),
+                "timeInForce": "GTC"
             },
+            "stopLossOnFill": {
+                "price": str(sl_price),
+                "timeInForce": "GTC",
+                "triggerMode": "TOP_OF_BOOK"
+            }
         }
     }
 
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    r = requests.post(url, headers=HEADERS, json=payload, timeout=20)
+    r = requests.post(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-    data = r.json()
+    return r.json()
 
-    logging.info(f"TRADE: {pair} {side}")
-    logging.info(data)
 
-    last_trade_time[pair] = time.time()
-    return data
+def replace_trade_sl(trade_id, new_sl_price):
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders"
+    payload = {
+        "stopLoss": {
+            "timeInForce": "GTC",
+            "price": str(new_sl_price),
+            "triggerMode": "TOP_OF_BOOK"
+        }
+    }
+    r = requests.put(url, headers=HEADERS, json=payload, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
 
 # =========================
-# TRADE MANAGER
+# FILTERS
 # =========================
-def unrealized_pips(trade, bid, ask):
-    pair = trade["instrument"]
-    entry = float(trade["price"])
-    current = bid if float(trade["currentUnits"]) > 0 else ask
-    diff = current - entry if float(trade["currentUnits"]) > 0 else entry - current
-    return price_to_pips(pair, diff)
+def trend_filter_pass(pair, side):
+    if not ENABLE_TREND_FILTER:
+        return True, "trend filter off"
+
+    candles = get_candles(pair, count=max(SLOW_MA_PERIOD + 5, SLOW_EMA_PERIOD + 5, 60))
+    closes = [price_from_candle(c) for c in candles]
+
+    fast_val = ema(closes, FAST_EMA_PERIOD) if FAST_EMA_PERIOD > 0 else None
+    slow_val = ema(closes, SLOW_EMA_PERIOD) if SLOW_EMA_PERIOD > 0 else None
+
+    if fast_val is None or slow_val is None:
+        return False, "trend data insufficient"
+
+    gap_pips = abs(fast_val - slow_val) / pip_size(pair)
+    if gap_pips < MIN_TREND_GAP_PIPS:
+        return False, "trend gap too weak"
+
+    if side == "buy" and fast_val <= slow_val:
+        return False, "trend not bullish"
+    if side == "sell" and fast_val >= slow_val:
+        return False, "trend not bearish"
+
+    return True, "trend ok"
 
 
-def manage_trade(trade):
+def momentum_filter_pass(pair, side):
+    if not ENABLE_MOMENTUM_FILTER:
+        return True, "momentum filter off"
+
+    candles = get_candles(pair, count=max(MOMENTUM_CANDLES + 3, 10))
+    check = candles[-MOMENTUM_CANDLES:]
+
+    for c in check:
+        o = open_from_candle(c)
+        cl = price_from_candle(c)
+        bp = body_pips(c, pair)
+
+        if bp < MOMENTUM_MIN_BODY_PIPS:
+            return False, "momentum body too small"
+
+        if side == "buy" and cl <= o:
+            return False, "not bullish momentum"
+        if side == "sell" and cl >= o:
+            return False, "not bearish momentum"
+
+    return True, "momentum ok"
+
+
+def volatility_filter_pass(pair):
+    if not ENABLE_VOLATILITY_FILTER:
+        return True, "volatility filter off"
+
+    candles = get_candles(pair, count=10)
+    if not candles:
+        return False, "no candles"
+
+    rp = range_pips(candles[-1], pair)
+
+    if rp < MIN_VOLATILITY_PIPS:
+        return False, "volatility too low"
+    if rp > MAX_CANDLE_RANGE_PIPS:
+        return False, "candle too large"
+
+    return True, "volatility ok"
+
+
+def spread_filter_pass(pair):
+    if not ENABLE_SPREAD_FILTER:
+        return True, "spread filter off"
+
+    sp = get_spread_pips(pair)
+    if sp > MAX_SPREAD_PIPS:
+        return False, f"spread too high ({sp:.2f})"
+
+    return True, "spread ok"
+
+
+def all_filters_pass(pair, side):
+    ok, msg = spread_filter_pass(pair)
+    if not ok:
+        return False, msg
+
+    ok, msg = trend_filter_pass(pair, side)
+    if not ok:
+        return False, msg
+
+    ok, msg = momentum_filter_pass(pair, side)
+    if not ok:
+        return False, msg
+
+    ok, msg = volatility_filter_pass(pair)
+    if not ok:
+        return False, msg
+
+    ok, msg = can_trade_pair(pair)
+    if not ok:
+        return False, msg
+
+    return True, "ok"
+
+
+# =========================
+# TRADE MANAGEMENT
+# =========================
+def trade_side(trade):
+    units = float(trade.get("currentUnits", trade.get("initialUnits", trade.get("units", 0))))
+    return "buy" if units > 0 else "sell"
+
+
+def trade_units(trade):
+    return abs(float(trade.get("currentUnits", trade.get("initialUnits", trade.get("units", 0)))))
+
+
+def trade_entry_price(trade):
+    return float(trade["price"])
+
+
+def trade_unrealized_pl(trade):
+    return float(trade.get("unrealizedPL", 0))
+
+
+def get_trade_pips_profit(trade):
     pair = trade["instrument"]
+    side = trade_side(trade)
+    entry = trade_entry_price(trade)
+    current = get_trade_price_now(pair, side)
+    ps = pip_size(pair)
+
+    if side == "buy":
+        return (current - entry) / ps
+    return (entry - current) / ps
+
+
+def current_sl_price(trade):
+    sl = trade.get("stopLossOrder")
+    if not sl:
+        return None
+    try:
+        return float(sl["price"])
+    except Exception:
+        return None
+
+
+def round_price_for_pair(pair, price):
+    return round(price, 3 if "JPY" in pair else 5)
+
+
+def better_sl(side, current_sl, new_sl):
+    if current_sl is None:
+        return True
+    if side == "buy":
+        return new_sl > current_sl
+    return new_sl < current_sl
+
+
+def maybe_move_stop(trade):
+    pair = trade["instrument"]
+    side = trade_side(trade)
+    entry = trade_entry_price(trade)
     trade_id = trade["id"]
-    units = float(trade["currentUnits"])
-    entry = float(trade["price"])
-    pip = pip_size(pair)
+    ps = pip_size(pair)
+    pips_profit = get_trade_pips_profit(trade)
+    current_sl = current_sl_price(trade)
 
-    bid, ask = get_bid_ask(pair)
-    upips = unrealized_pips(trade, bid, ask)
+    target_sl = None
 
-    desired_sl = None
-
-    # break even
-    if upips >= BREAK_EVEN_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = entry + (BREAK_EVEN_PLUS_PIPS * pip)
+    if pips_profit >= LOCK_3_TRIGGER_PIPS:
+        if side == "buy":
+            target_sl = entry + (LOCK_2_TRIGGER_PIPS * ps)
         else:
-            desired_sl = entry - (BREAK_EVEN_PLUS_PIPS * pip)
+            target_sl = entry - (LOCK_2_TRIGGER_PIPS * ps)
 
-    # lock levels
-    if upips >= LOCK_1_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = max(desired_sl or -999999, entry + (5 * pip))
+    elif pips_profit >= LOCK_2_TRIGGER_PIPS:
+        if side == "buy":
+            target_sl = entry + (LOCK_1_TRIGGER_PIPS * ps)
         else:
-            desired_sl = min(desired_sl or 999999, entry - (5 * pip))
+            target_sl = entry - (LOCK_1_TRIGGER_PIPS * ps)
 
-    if upips >= LOCK_2_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = max(desired_sl or -999999, entry + (12 * pip))
+    elif pips_profit >= LOCK_1_TRIGGER_PIPS:
+        if side == "buy":
+            target_sl = entry + (BREAK_EVEN_PLUS_PIPS * ps)
         else:
-            desired_sl = min(desired_sl or 999999, entry - (12 * pip))
+            target_sl = entry - (BREAK_EVEN_PLUS_PIPS * ps)
 
-    if upips >= LOCK_3_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = max(desired_sl or -999999, entry + (20 * pip))
+    elif pips_profit >= BREAK_EVEN_TRIGGER_PIPS:
+        if side == "buy":
+            target_sl = entry + (BREAK_EVEN_PLUS_PIPS * ps)
         else:
-            desired_sl = min(desired_sl or 999999, entry - (20 * pip))
+            target_sl = entry - (BREAK_EVEN_PLUS_PIPS * ps)
 
-    # trailing
-    if ENABLE_TRAILING and upips >= TRAILING_TRIGGER_PIPS:
-        if units > 0:
-            trailing_sl = bid - (TRAILING_DISTANCE_PIPS * pip)
-            desired_sl = max(desired_sl or -999999, trailing_sl)
+    if ENABLE_TRAILING and pips_profit >= TRAILING_TRIGGER_PIPS:
+        current_price = get_trade_price_now(pair, side)
+        if side == "buy":
+            trailing_sl = current_price - (TRAILING_DISTANCE_PIPS * ps)
         else:
-            trailing_sl = ask + (TRAILING_DISTANCE_PIPS * pip)
-            desired_sl = min(desired_sl or 999999, trailing_sl)
+            trailing_sl = current_price + (TRAILING_DISTANCE_PIPS * ps)
 
-    if desired_sl is None:
+        if target_sl is None:
+            target_sl = trailing_sl
+        else:
+            if side == "buy":
+                target_sl = max(target_sl, trailing_sl)
+            else:
+                target_sl = min(target_sl, trailing_sl)
+
+    if target_sl is None:
         return
 
-    current_sl = None
-    sl_obj = trade.get("stopLossOrder")
-    if sl_obj and sl_obj.get("price"):
-        current_sl = float(sl_obj["price"])
+    target_sl = round_price_for_pair(pair, target_sl)
 
-    should_update = False
-    if current_sl is None:
-        should_update = True
-    elif units > 0 and desired_sl > current_sl:
-        should_update = True
-    elif units < 0 and desired_sl < current_sl:
-        should_update = True
+    if not better_sl(side, current_sl, target_sl):
+        return
 
-    if should_update:
-        logging.info(f"MANAGER | updating SL | trade={trade_id} pair={pair} upips={upips:.1f} new_sl={desired_sl}")
-        try:
-            replace_trade_sl(trade_id, desired_sl)
-        except Exception as e:
-            logging.warning(f"MANAGER | failed to update SL for {trade_id}: {e}")
+    try:
+        replace_trade_sl(trade_id, target_sl)
+        logging.info(f"SL moved | pair={pair} trade_id={trade_id} side={side} new_sl={target_sl}")
+    except Exception as e:
+        logging.warning(f"Failed SL move | pair={pair} trade_id={trade_id} error={e}")
 
 
-def monitor_loop():
+def manager_loop():
+    logging.info("Trade manager started")
     while True:
         try:
-            if ENABLE_V21_MANAGER:
+            if ENABLE_V21_MANAGER or ENABLE_TRAILING:
                 trades = get_open_trades()
                 for trade in trades:
-                    manage_trade(trade)
+                    try:
+                        maybe_move_stop(trade)
+                    except Exception as trade_err:
+                        logging.warning(f"Manager trade error: {trade_err}")
         except Exception as e:
-            logging.warning(f"MONITOR LOOP ERROR: {e}")
+            logging.warning(f"Manager loop error: {e}")
 
-        time.sleep(max(3, MONITOR_INTERVAL))
+        time.sleep(max(5, MONITOR_INTERVAL))
 
 
 def start_manager_once():
     global manager_started
-    if manager_started:
-        return
-    manager_started = True
-    t = threading.Thread(target=monitor_loop, daemon=True)
-    t.start()
-    logging.info("Trade manager started")
+    with manager_lock:
+        if manager_started:
+            return
+        t = threading.Thread(target=manager_loop, daemon=True)
+        t.start()
+        manager_started = True
 
 
 # =========================
@@ -701,83 +656,76 @@ def start_manager_once():
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"ok": True, "message": "bot is live"}), 200
+    return jsonify({
+        "ok": True,
+        "service": "forex-bot",
+        "env": OANDA_ENV,
+        "pairs": PAIR_LIST
+    })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
-        "env": OANDA_ENV,
-        "pairs": PAIR_LIST,
-        "manager": ENABLE_V21_MANAGER,
-    }), 200
+    return jsonify({"ok": True})
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    start_manager_once()
+
     try:
         data = request.get_json(force=True, silent=True) or {}
 
         passphrase = str(data.get("passphrase", "")).strip()
-        if passphrase != WEBHOOK_PASSPHRASE:
-            return jsonify({"ok": False, "error": "bad passphrase"}), 403
+        if WEBHOOK_PASSPHRASE and passphrase != WEBHOOK_PASSPHRASE:
+            return jsonify({"ok": False, "reason": "bad passphrase"}), 401
 
-        pair = str(data.get("pair", "")).strip().upper()
-        side = str(data.get("side", "")).strip().upper()
+        pair = str(data.get("pair", data.get("symbol", ""))).upper().strip()
+        side = str(data.get("side", data.get("action", ""))).lower().strip()
 
-        if not pair or side not in ["BUY", "SELL"]:
-            return jsonify({"ok": False, "error": "pair/side invalid"}), 400
+        if pair not in PAIR_LIST:
+            return jsonify({"ok": False, "reason": f"pair not allowed: {pair}"}), 200
 
-        sl = safe_float(data.get("sl", DEFAULT_SL_PIPS), DEFAULT_SL_PIPS)
-        tp = safe_float(data.get("tp", DEFAULT_TP_PIPS), DEFAULT_TP_PIPS)
-        risk = safe_float(data.get("risk", RISK_PERCENT), RISK_PERCENT)
+        if side not in ["buy", "sell"]:
+            return jsonify({"ok": False, "reason": "side must be buy or sell"}), 200
+
+        sl_pips = float(data.get("sl", data.get("stop_loss_pips", DEFAULT_SL_PIPS)))
+        tp_pips = float(data.get("tp", data.get("take_profit_pips", DEFAULT_TP_PIPS)))
+        units = int(float(data.get("units", units_for_pair(pair))))
 
         logging.info(
-            f"WEBHOOK RECEIVED | pair={pair} side={side} risk={risk} sl={sl} tp={tp} trailing={ENABLE_TRAILING}"
+            f"WEBHOOK RECEIVED | pair={pair} side={side} "
+            f"risk={RISK_PERCENT} sl={sl_pips} tp={tp_pips} trailing={ENABLE_TRAILING}"
         )
 
         allowed, reason = all_filters_pass(pair, side)
         if not allowed:
+            logging.info(f"TRADE BLOCKED | pair={pair} side={side} reason={reason}")
             return jsonify({"ok": False, "reason": reason}), 200
 
-        result = place_market_order(pair=pair, side=side, units=FIXED_UNITS, sl_pips=sl, tp_pips=tp)
-        return jsonify({"ok": True, "result": result}), 200
+        result = place_market_order(pair, side, units, sl_pips, tp_pips)
+        last_trade_time[pair] = time.time()
 
-    except requests.HTTPError as e:
-        body = ""
-        try:
-            body = e.response.text
-        except Exception:
-            pass
-        logging.exception("HTTP ERROR")
-        return jsonify({"ok": False, "error": str(e), "body": body}), 500
+        logging.info(f"TRADE OPENED | pair={pair} side={side} units={units}")
+        return jsonify({
+            "ok": True,
+            "pair": pair,
+            "side": side,
+            "units": units,
+            "result": result
+        }), 200
 
-    except Exception as e:
-        logging.exception("WEBHOOK ERROR")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except requests.exceptions.Timeout:
+        logging.exception("Webhook timeout talking to OANDA")
+        return jsonify({"ok": False, "reason": "oanda timeout"}), 200
 
-
-@app.route("/close_all", methods=["POST"])
-def close_all():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        passphrase = str(data.get("passphrase", "")).strip()
-        if passphrase != WEBHOOK_PASSPHRASE:
-            return jsonify({"ok": False, "error": "bad passphrase"}), 403
-
-        results = []
-        for trade in get_open_trades():
-            try:
-                results.append(close_trade(trade["id"]))
-            except Exception as e:
-                results.append({"trade_id": trade["id"], "error": str(e)})
-
-        return jsonify({"ok": True, "closed": results}), 200
+    except requests.exceptions.RequestException as e:
+        logging.exception(f"Webhook request error: {e}")
+        return jsonify({"ok": False, "reason": f"request error: {str(e)}"}), 200
 
     except Exception as e:
-        logging.exception("CLOSE ALL ERROR")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logging.exception(f"Webhook unexpected error: {e}")
+        return jsonify({"ok": False, "reason": f"unexpected error: {str(e)}"}), 200
 
 
 # =========================
