@@ -28,7 +28,6 @@ HEADERS = {
 }
 
 PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
-
 PAIRS = [p.strip() for p in os.getenv("PAIRS", "EUR_USD,GBP_USD,USD_JPY").split(",")]
 
 UNITS = int(os.getenv("UNITS", "5000"))
@@ -36,7 +35,6 @@ MAX_TOTAL_TRADES = int(os.getenv("MAX_TOTAL_TRADES", "2"))
 MAX_TRADES_PER_PAIR = int(os.getenv("MAX_TRADES_PER_PAIR", "1"))
 SPREAD_LIMIT_PIPS = float(os.getenv("SPREAD_LIMIT_PIPS", "2.0"))
 
-# Risk / trade management
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "15"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "30"))
 
@@ -48,15 +46,14 @@ LOCK_2_PIPS = float(os.getenv("LOCK_2_PIPS", "5"))
 TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "15"))
 TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "5"))
 
-# Session filter
+SESSION_MODE = os.getenv("SESSION_MODE", "london").lower()
 LONDON_START_HOUR_EST = int(os.getenv("LONDON_START_HOUR_EST", "3"))
 LONDON_END_HOUR_EST = int(os.getenv("LONDON_END_HOUR_EST", "13"))
-NEW_YORK_START_HOUR_EST = int(os.getenv("NY_START_HOUR_EST", "8"))
-NEW_YORK_END_HOUR_EST = int(os.getenv("NY_END_HOUR_EST", "17"))
-SESSION_MODE = os.getenv("SESSION_MODE", "london").lower()  
-# options: london / ny / london_ny / off
+NY_START_HOUR_EST = int(os.getenv("NY_START_HOUR_EST", "8"))
+NY_END_HOUR_EST = int(os.getenv("NY_END_HOUR_EST", "17"))
 
 MANAGE_INTERVAL_SECONDS = int(os.getenv("MANAGE_INTERVAL_SECONDS", "15"))
+
 
 # =========================
 # HELPERS
@@ -67,9 +64,11 @@ def validate_config():
         missing.append("OANDA_API_KEY")
     if not ACCOUNT_ID:
         missing.append("ACCOUNT_ID")
+
     if missing:
         logging.error(f"Missing required env vars: {', '.join(missing)}")
-    return len(missing) == 0
+        return False
+    return True
 
 
 def pip_size(pair: str) -> float:
@@ -85,8 +84,7 @@ def format_price(pair: str, price: float) -> str:
 
 
 def now_est():
-    est = pytz.timezone("America/New_York")
-    return datetime.now(est)
+    return datetime.now(pytz.timezone("America/New_York"))
 
 
 def in_allowed_session():
@@ -96,7 +94,7 @@ def in_allowed_session():
     hour = now_est().hour
 
     in_london = LONDON_START_HOUR_EST <= hour < LONDON_END_HOUR_EST
-    in_ny = NEW_YORK_START_HOUR_EST <= hour < NEW_YORK_END_HOUR_EST
+    in_ny = NY_START_HOUR_EST <= hour < NY_END_HOUR_EST
 
     if SESSION_MODE == "london":
         return in_london
@@ -223,10 +221,9 @@ def set_stop_loss(trade_id, pair, sl_price):
 
 def set_trailing_stop(trade_id, pair, distance_pips):
     distance = distance_pips * pip_size(pair)
-    precision = price_precision(pair)
     payload = {
         "trailingStopLoss": {
-            "distance": f"{distance:.{precision}f}"
+            "distance": format_price(pair, distance)
         }
     }
     response = oanda_put(f"/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders", payload)
@@ -235,24 +232,22 @@ def set_trailing_stop(trade_id, pair, distance_pips):
 
 
 def better_stop_for_buy(new_sl, old_sl):
-    if old_sl is None:
-        return True
-    return new_sl > old_sl
+    return old_sl is None or new_sl > old_sl
 
 
 def better_stop_for_sell(new_sl, old_sl):
-    if old_sl is None:
-        return True
-    return new_sl < old_sl
+    return old_sl is None or new_sl < old_sl
 
 
 def manage_trade(trade):
     trade_id = trade["id"]
     pair = trade["instrument"]
     entry = float(trade["price"])
-    current = float(trade["currentPrice"])
     units = float(trade["currentUnits"])
     ps = pip_size(pair)
+
+    bid, ask, _ = get_pricing(pair)
+    current = bid if units > 0 else ask
 
     if units > 0:
         pips = (current - entry) / ps
@@ -353,9 +348,6 @@ def webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-# =========================
-# START BACKGROUND MANAGER
-# =========================
 manager_thread = threading.Thread(target=manage_all_trades_loop, daemon=True)
 manager_thread.start()
 
