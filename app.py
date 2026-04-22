@@ -316,12 +316,15 @@ def webhook():
         logging.info(f"WEBHOOK RECEIVED | pair={pair} action={action}")
 
         if passphrase != PASSPHRASE:
+            logging.info("BLOCKED: invalid passphrase")
             return jsonify({"status": "error", "message": "Invalid passphrase"}), 403
 
         if pair not in PAIRS:
+            logging.info(f"BLOCKED: invalid pair {pair}")
             return jsonify({"status": "error", "message": f"Invalid pair: {pair}"}), 400
 
         if action not in {"buy", "sell"}:
+            logging.info(f"BLOCKED: invalid action {action}")
             return jsonify({"status": "error", "message": f"Invalid action: {action}"}), 400
 
         if not in_allowed_session():
@@ -340,7 +343,10 @@ def webhook():
             logging.info(f"BLOCKED: same direction trade already open on {pair}")
             return jsonify({"status": "blocked", "message": f"Same direction trade already open on {pair}"}), 200
 
+        logging.info("TRYING TO PLACE TRADE...")
         response = place_trade(pair, action)
+        logging.info("TRADE SUCCESS")
+
         return jsonify({"status": "ok", "message": "Trade placed", "response": response}), 200
 
     except Exception as e:
