@@ -33,16 +33,15 @@ MAX_TOTAL_TRADES = int(os.getenv("MAX_TOTAL_TRADES", "2"))
 MAX_TRADES_PER_PAIR = int(os.getenv("MAX_TRADES_PER_PAIR", "1"))
 SPREAD_LIMIT_PIPS = float(os.getenv("SPREAD_LIMIT_PIPS", "2.0"))
 
+# AGGRESSIVE V33
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "15"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "30"))
 
-BREAK_EVEN_TRIGGER_PIPS = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", "5"))
-LOCK_1_TRIGGER_PIPS = float(os.getenv("LOCK_1_TRIGGER_PIPS", "8"))
-LOCK_1_PIPS = float(os.getenv("LOCK_1_PIPS", "2"))
-LOCK_2_TRIGGER_PIPS = float(os.getenv("LOCK_2_TRIGGER_PIPS", "12"))
-LOCK_2_PIPS = float(os.getenv("LOCK_2_PIPS", "5"))
-TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "15"))
-TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "5"))
+BREAK_EVEN_TRIGGER_PIPS = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", "10"))
+LOCK_1_TRIGGER_PIPS = float(os.getenv("LOCK_1_TRIGGER_PIPS", "15"))
+LOCK_1_PIPS = float(os.getenv("LOCK_1_PIPS", "5"))
+TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "20"))
+TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "8"))
 
 SESSION_MODE = os.getenv("SESSION_MODE", "off").lower()
 LONDON_START_HOUR_EST = int(os.getenv("LONDON_START_HOUR_EST", "3"))
@@ -51,6 +50,9 @@ NY_START_HOUR_EST = int(os.getenv("NY_START_HOUR_EST", "8"))
 NY_END_HOUR_EST = int(os.getenv("NY_END_HOUR_EST", "17"))
 
 MANAGE_INTERVAL_SECONDS = int(os.getenv("MANAGE_INTERVAL_SECONDS", "15"))
+
+# prevents duplicate trailing stop spam
+TRAILING_SET = set()
 
 
 # =========================
@@ -259,14 +261,13 @@ def manage_trade(trade):
     old_sl = extract_existing_sl_price(trade)
     desired_sl = None
 
+    # break even
     if pips >= BREAK_EVEN_TRIGGER_PIPS:
         desired_sl = entry
 
+    # lock profit
     if pips >= LOCK_1_TRIGGER_PIPS:
         desired_sl = entry + (LOCK_1_PIPS * ps) if units > 0 else entry - (LOCK_1_PIPS * ps)
-
-    if pips >= LOCK_2_TRIGGER_PIPS:
-        desired_sl = entry + (LOCK_2_PIPS * ps) if units > 0 else entry - (LOCK_2_PIPS * ps)
 
     if desired_sl is not None:
         if units > 0 and better_stop_for_buy(desired_sl, old_sl):
@@ -274,9 +275,11 @@ def manage_trade(trade):
         elif units < 0 and better_stop_for_sell(desired_sl, old_sl):
             set_stop_loss(trade_id, pair, desired_sl)
 
-    if pips >= TRAILING_TRIGGER_PIPS:
+    # trailing
+    if pips >= TRAILING_TRIGGER_PIPS and trade_id not in TRAILING_SET:
         try:
             set_trailing_stop(trade_id, pair, TRAILING_DISTANCE_PIPS)
+            TRAILING_SET.add(trade_id)
         except Exception as e:
             logging.warning(f"Trailing stop update failed for trade {trade_id}: {e}")
 
@@ -285,8 +288,13 @@ def manage_all_trades_loop():
     while True:
         try:
             if validate_config():
-                trades = get_open_trades()
-                for trade in trades:
+                open_trade_ids = {t["id"] for t in get_open_trades()}
+                # clean up old trailing ids
+                stale = [tid for tid in TRAILING_SET if tid not in open_trade_ids]
+                for tid in stale:
+                    TRAILING_SET.discard(tid)
+
+                for trade in get_open_trades():
                     manage_trade(trade)
         except Exception as e:
             logging.error(f"Trade manager error: {e}")
@@ -298,7 +306,7 @@ def manage_all_trades_loop():
 # =========================
 @app.route("/")
 def home():
-    return "Bot Running V32 🚀"
+    return "Bot Running V33 🚀"
 
 
 @app.route("/webhook", methods=["POST"])
