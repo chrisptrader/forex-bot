@@ -1,4 +1,5 @@
-import os
+
+    import os
 import time
 import logging
 from datetime import datetime
@@ -10,27 +11,17 @@ import requests
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ================= CONFIG =================
+# ---------------- CONFIG ----------------
+OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+OANDA_ENV = os.getenv("OANDA_ENV", "practice")
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
 
-def env(name, default):
-    return os.getenv(name, str(default))
+PAIR_LIST = ["EUR_USD", "GBP_USD", "USD_JPY"]
 
-OANDA_API_KEY = env("OANDA_API_KEY", "")
-OANDA_ACCOUNT_ID = env("OANDA_ACCOUNT_ID", "")
-OANDA_ENV = env("OANDA_ENV", "practice").lower()
-WEBHOOK_PASSPHRASE = env("WEBHOOK_PASSPHRASE", "1234")
-
-RISK_PERCENT = float(env("RISK_PERCENT", 0.02))
-FIXED_UNITS = int(env("FIXED_UNITS", 5000))
-
-STOP_LOSS_PIPS = float(env("STOP_LOSS_PIPS", 20))
-TAKE_PROFIT_PIPS = float(env("TAKE_PROFIT_PIPS", 80))
-
-MAX_SPREAD_PIPS = float(env("MAX_SPREAD_PIPS", 10))
-
-TIMEZONE = env("TIMEZONE_NAME", "America/New_York")
-
-BASE_URL = "https://api-fxpractice.oanda.com" if OANDA_ENV != "live" else "https://api-fxtrade.oanda.com"
+BASE_URL = "https://api-fxpractice.oanda.com"
+if OANDA_ENV == "live":
+    BASE_URL = "https://api-fxtrade.oanda.com"
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
@@ -38,111 +29,122 @@ HEADERS = {
 }
 
 last_trade_time = {}
-trade_cooldown = 60  # seconds
 
-# ================= HELPERS =================
-
+# ---------------- HELPERS ----------------
 def pip_size(pair):
     return 0.01 if "JPY" in pair else 0.0001
 
-def now():
-    return datetime.now(ZoneInfo(TIMEZONE))
+def safe_request(method, url, **kwargs):
+    return requests.request(method, url, timeout=8, **kwargs)
 
-def get_price(pair):
-    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    r = requests.get(url, headers=HEADERS, params={"instruments": pair})
-    data = r.json()["prices"][0]
-    bid = float(data["bids"][0]["price"])
-    ask = float(data["asks"][0]["price"])
-    spread = abs(ask - bid)
-    return bid, ask, spread
+# ---------------- PRICE FIX (KEY PART) ----------------
+def get_prices(pair):
+    try:
+        url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+        r = safe_request("GET", url, headers=HEADERS, params={"instruments": pair})
 
-def spread_ok(pair):
-    bid, ask, spread = get_price(pair)
-    spread_pips = spread / pip_size(pair)
-    if spread_pips > MAX_SPREAD_PIPS:
-        logging.info(f"BLOCKED spread too high: {spread_pips}")
-        return False
-    return True
+        data = r.json()
 
+        if "prices" not in data or len(data["prices"]) == 0:
+            logging.error(f"NO PRICE DATA: {data}")
+            return None
+
+        return data["prices"][0]
+
+    except Exception as e:
+        logging.error(f"PRICE ERROR: {e}")
+        return None
+
+def get_bid_ask(pair):
+    p = get_prices(pair)
+    if not p:
+        return None, None
+
+    bid = float(p["bids"][0]["price"])
+    ask = float(p["asks"][0]["price"])
+    return bid, ask
+
+def get_spread(pair):
+    bid, ask = get_bid_ask(pair)
+    if bid is None or ask is None:
+        return 999
+    return (ask - bid) / pip_size(pair)
+
+# ---------------- MARKET LOGIC ----------------
 def get_candles(pair):
     url = f"{BASE_URL}/v3/instruments/{pair}/candles"
-    params = {"granularity": "M1", "count": 5}
-    r = requests.get(url, headers=HEADERS, params=params)
-    candles = r.json()["candles"]
+    r = safe_request("GET", url, headers=HEADERS, params={"count": 20, "granularity": "M5"})
+    data = r.json()
+
+    candles = []
+    for c in data.get("candles", []):
+        mid = c["mid"]
+        candles.append({
+            "o": float(mid["o"]),
+            "h": float(mid["h"]),
+            "l": float(mid["l"]),
+            "c": float(mid["c"])
+        })
     return candles
 
-# ================= STRATEGY =================
-
-def is_trending(pair):
+def is_sideways(pair):
     candles = get_candles(pair)
-    closes = [float(c["mid"]["c"]) for c in candles if c["complete"]]
+    if len(candles) < 10:
+        return True
 
-    if len(closes) < 3:
+    highs = [c["h"] for c in candles[-10:]]
+    lows = [c["l"] for c in candles[-10:]]
+
+    range_pips = (max(highs) - min(lows)) / pip_size(pair)
+
+    return range_pips < 12
+
+def pullback_confirmation(pair, side):
+    candles = get_candles(pair)
+    if len(candles) < 4:
         return False
 
-    move = abs(closes[-1] - closes[0]) / pip_size(pair)
+    c1, c2, c3, c4 = candles[-4:]
 
-    # 🔥 Skip sideways
-    return move > 3  # must move at least 3 pips
-
-def confirm_entry(pair, side):
-    candles = get_candles(pair)
-
-    if len(candles) < 3:
-        return False
-
-    last = candles[-1]
-    prev = candles[-2]
-
-    last_close = float(last["mid"]["c"])
-    last_open = float(last["mid"]["o"])
-    prev_close = float(prev["mid"]["c"])
-    prev_open = float(prev["mid"]["o"])
-
-    # 🔥 confirmation logic
     if side == "buy":
-        return last_close > last_open and last_close > prev_close
-    else:
-        return last_close < last_open and last_close < prev_close
+        return c4["c"] > c3["h"]
 
-# ================= EXECUTION =================
+    if side == "sell":
+        return c4["c"] < c3["l"]
 
+    return False
+
+# ---------------- TRADE ----------------
 def place_trade(pair, side):
-    if not spread_ok(pair):
+    bid, ask = get_bid_ask(pair)
+
+    if bid is None or ask is None:
+        logging.error("BLOCKED: no price data")
         return
 
-    if not is_trending(pair):
-        logging.info("BLOCKED: market sideways")
-        return
+    units = 5000
+    sl_pips = 20
+    tp_pips = 80
 
-    if not confirm_entry(pair, side):
-        logging.info("BLOCKED: no confirmation")
-        return
+    p = pip_size(pair)
 
-    now_time = time.time()
-    if pair in last_trade_time and now_time - last_trade_time[pair] < trade_cooldown:
-        logging.info("BLOCKED: cooldown")
-        return
+    if side == "buy":
+        entry = ask
+        sl = entry - sl_pips * p
+        tp = entry + tp_pips * p
+        units = abs(units)
+    else:
+        entry = bid
+        sl = entry + sl_pips * p
+        tp = entry - tp_pips * p
+        units = -abs(units)
 
-    last_trade_time[pair] = now_time
-
-    units = FIXED_UNITS if side == "buy" else -FIXED_UNITS
-
-    bid, ask, _ = get_price(pair)
-    price = ask if side == "buy" else bid
-
-    pip = pip_size(pair)
-
-    sl = price - STOP_LOSS_PIPS * pip if side == "buy" else price + STOP_LOSS_PIPS * pip
-    tp = price + TAKE_PROFIT_PIPS * pip if side == "buy" else price - TAKE_PROFIT_PIPS * pip
-
-    data = {
+    body = {
         "order": {
-            "units": str(units),
-            "instrument": pair,
-            "timeInForce": "FOK",
             "type": "MARKET",
+            "instrument": pair,
+            "units": str(units),
+            "timeInForce": "FOK",
             "positionFill": "DEFAULT",
             "stopLossOnFill": {"price": f"{sl:.5f}"},
             "takeProfitOnFill": {"price": f"{tp:.5f}"}
@@ -150,36 +152,54 @@ def place_trade(pair, side):
     }
 
     url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    r = requests.post(url, headers=HEADERS, json=data)
+    r = safe_request("POST", url, headers=HEADERS, json=body)
+    logging.info(f"TRADE SENT: {r.json()}")
 
-    if r.status_code == 201:
-        logging.info(f"TRADE OPENED {pair} {side}")
-    else:
-        logging.error(f"ORDER FAILED {r.text}")
-
-# ================= WEBHOOK =================
-
+# ---------------- WEBHOOK ----------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    try:
+        data = request.get_json()
 
-    if data.get("passphrase") != WEBHOOK_PASSPHRASE:
-        return jsonify({"error": "unauthorized"}), 403
+        if data.get("passphrase") != WEBHOOK_PASSPHRASE:
+            return jsonify({"error": "bad passphrase"}), 403
 
-    pair = data.get("pair")
-    side = data.get("side")
+        pair = data.get("pair")
+        side = data.get("side")
 
-    logging.info(f"WEBHOOK RECEIVED {pair} {side}")
+        logging.info(f"WEBHOOK RECEIVED {pair} {side}")
 
-    place_trade(pair, side)
+        if pair not in PAIR_LIST:
+            return jsonify({"error": "pair not allowed"}), 200
 
-    return jsonify({"status": "ok"})
+        # spread filter
+        if get_spread(pair) > 12:
+            logging.info("BLOCKED: spread")
+            return jsonify({"blocked": "spread"}), 200
 
+        # sideways filter
+        if is_sideways(pair):
+            logging.info("BLOCKED: market sideways")
+            return jsonify({"blocked": "sideways"}), 200
+
+        # pullback confirmation
+        if not pullback_confirmation(pair, side):
+            logging.info("BLOCKED: no confirmation")
+            return jsonify({"blocked": "confirmation"}), 200
+
+        place_trade(pair, side)
+
+        return jsonify({"ok": True}), 200
+
+    except Exception as e:
+        logging.error(f"ERROR: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- HOME ----------------
 @app.route("/")
 def home():
-    return "BOT RUNNING"
+    return {"status": "running v28 stable"}
 
-# ================= RUN =================
-
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
