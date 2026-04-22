@@ -3,9 +3,10 @@ import time
 import threading
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify
-import requests
+
 import pytz
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -17,18 +18,15 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
 
-if OANDA_ENV == "live":
-    BASE_URL = "https://api-fxtrade.oanda.com/v3"
-else:
-    BASE_URL = "https://api-fxpractice.oanda.com/v3"
+BASE_URL = "https://api-fxtrade.oanda.com/v3" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com/v3"
 
 HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
 
 PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
-PAIRS = [p.strip() for p in os.getenv("PAIRS", "EUR_USD,GBP_USD,USD_JPY").split(",")]
+PAIRS = [p.strip().upper() for p in os.getenv("PAIRS", "EUR_USD,GBP_USD,USD_JPY").split(",") if p.strip()]
 
 UNITS = int(os.getenv("UNITS", "5000"))
 MAX_TOTAL_TRADES = int(os.getenv("MAX_TOTAL_TRADES", "2"))
@@ -46,7 +44,7 @@ LOCK_2_PIPS = float(os.getenv("LOCK_2_PIPS", "5"))
 TRAILING_TRIGGER_PIPS = float(os.getenv("TRAILING_TRIGGER_PIPS", "15"))
 TRAILING_DISTANCE_PIPS = float(os.getenv("TRAILING_DISTANCE_PIPS", "5"))
 
-SESSION_MODE = os.getenv("SESSION_MODE", "london").lower()
+SESSION_MODE = os.getenv("SESSION_MODE", "off").lower()
 LONDON_START_HOUR_EST = int(os.getenv("LONDON_START_HOUR_EST", "3"))
 LONDON_END_HOUR_EST = int(os.getenv("LONDON_END_HOUR_EST", "13"))
 NY_START_HOUR_EST = int(os.getenv("NY_START_HOUR_EST", "8"))
@@ -58,7 +56,7 @@ MANAGE_INTERVAL_SECONDS = int(os.getenv("MANAGE_INTERVAL_SECONDS", "15"))
 # =========================
 # HELPERS
 # =========================
-def validate_config():
+def validate_config() -> bool:
     missing = []
     if not OANDA_API_KEY:
         missing.append("OANDA_API_KEY")
@@ -83,16 +81,15 @@ def format_price(pair: str, price: float) -> str:
     return f"{price:.{price_precision(pair)}f}"
 
 
-def now_est():
+def now_est() -> datetime:
     return datetime.now(pytz.timezone("America/New_York"))
 
 
-def in_allowed_session():
+def in_allowed_session() -> bool:
     if SESSION_MODE == "off":
         return True
 
     hour = now_est().hour
-
     in_london = LONDON_START_HOUR_EST <= hour < LONDON_END_HOUR_EST
     in_ny = NY_START_HOUR_EST <= hour < NY_END_HOUR_EST
 
@@ -106,21 +103,21 @@ def in_allowed_session():
     return True
 
 
-def oanda_get(path, params=None):
+def oanda_get(path: str, params=None):
     url = f"{BASE_URL}{path}"
     r = requests.get(url, headers=HEADERS, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-def oanda_post(path, data):
+def oanda_post(path: str, data: dict):
     url = f"{BASE_URL}{path}"
     r = requests.post(url, headers=HEADERS, json=data, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-def oanda_put(path, data):
+def oanda_put(path: str, data: dict):
     url = f"{BASE_URL}{path}"
     r = requests.put(url, headers=HEADERS, json=data, timeout=20)
     r.raise_for_status()
@@ -132,15 +129,15 @@ def get_open_trades():
     return data.get("trades", [])
 
 
-def get_open_trades_for_pair(pair):
+def get_open_trades_for_pair(pair: str):
     return [t for t in get_open_trades() if t.get("instrument") == pair]
 
 
-def total_open_trades():
+def total_open_trades() -> int:
     return len(get_open_trades())
 
 
-def get_pricing(pair):
+def get_pricing(pair: str):
     data = oanda_get(f"/accounts/{ACCOUNT_ID}/pricing", params={"instruments": pair})
     prices = data["prices"][0]
     bid = float(prices["bids"][0]["price"])
@@ -149,9 +146,8 @@ def get_pricing(pair):
     return bid, ask, spread_pips
 
 
-def has_open_trade_same_direction(pair, action):
-    trades = get_open_trades_for_pair(pair)
-    for t in trades:
+def has_open_trade_same_direction(pair: str, action: str) -> bool:
+    for t in get_open_trades_for_pair(pair):
         units = float(t["currentUnits"])
         if action == "buy" and units > 0:
             return True
@@ -160,7 +156,25 @@ def has_open_trade_same_direction(pair, action):
     return False
 
 
-def build_order(pair, action):
+def extract_existing_sl_price(trade):
+    sl = trade.get("stopLossOrder")
+    if sl and "price" in sl:
+        return float(sl["price"])
+    return None
+
+
+def better_stop_for_buy(new_sl: float, old_sl):
+    return old_sl is None or new_sl > old_sl
+
+
+def better_stop_for_sell(new_sl: float, old_sl):
+    return old_sl is None or new_sl < old_sl
+
+
+# =========================
+# ORDER BUILD / PLACE
+# =========================
+def build_order(pair: str, action: str):
     bid, ask, spread_pips = get_pricing(pair)
 
     if spread_pips > SPREAD_LIMIT_PIPS:
@@ -194,32 +208,28 @@ def build_order(pair, action):
     }
 
 
-def place_trade(pair, action):
+def place_trade(pair: str, action: str):
     order_data = build_order(pair, action)
     response = oanda_post(f"/accounts/{ACCOUNT_ID}/orders", order_data)
     logging.info(f"TRADE RESPONSE: {response}")
     return response
 
 
-def extract_existing_sl_price(trade):
-    sl = trade.get("stopLossOrder")
-    if sl and "price" in sl:
-        return float(sl["price"])
-    return None
-
-
-def set_stop_loss(trade_id, pair, sl_price):
+# =========================
+# TRADE MANAGEMENT
+# =========================
+def set_stop_loss(trade_id: str, pair: str, sl_price: float):
     payload = {
         "stopLoss": {
             "price": format_price(pair, sl_price)
         }
     }
     response = oanda_put(f"/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders", payload)
-    logging.info(f"Updated stop loss for trade {trade_id}: {response}")
+    logging.info(f"STOP LOSS UPDATED | trade={trade_id} pair={pair} sl={format_price(pair, sl_price)}")
     return response
 
 
-def set_trailing_stop(trade_id, pair, distance_pips):
+def set_trailing_stop(trade_id: str, pair: str, distance_pips: float):
     distance = distance_pips * pip_size(pair)
     payload = {
         "trailingStopLoss": {
@@ -227,16 +237,8 @@ def set_trailing_stop(trade_id, pair, distance_pips):
         }
     }
     response = oanda_put(f"/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders", payload)
-    logging.info(f"Updated trailing stop for trade {trade_id}: {response}")
+    logging.info(f"TRAILING STOP UPDATED | trade={trade_id} pair={pair} distance_pips={distance_pips}")
     return response
-
-
-def better_stop_for_buy(new_sl, old_sl):
-    return old_sl is None or new_sl > old_sl
-
-
-def better_stop_for_sell(new_sl, old_sl):
-    return old_sl is None or new_sl < old_sl
 
 
 def manage_trade(trade):
@@ -261,16 +263,10 @@ def manage_trade(trade):
         desired_sl = entry
 
     if pips >= LOCK_1_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = entry + (LOCK_1_PIPS * ps)
-        else:
-            desired_sl = entry - (LOCK_1_PIPS * ps)
+        desired_sl = entry + (LOCK_1_PIPS * ps) if units > 0 else entry - (LOCK_1_PIPS * ps)
 
     if pips >= LOCK_2_TRIGGER_PIPS:
-        if units > 0:
-            desired_sl = entry + (LOCK_2_PIPS * ps)
-        else:
-            desired_sl = entry - (LOCK_2_PIPS * ps)
+        desired_sl = entry + (LOCK_2_PIPS * ps) if units > 0 else entry - (LOCK_2_PIPS * ps)
 
     if desired_sl is not None:
         if units > 0 and better_stop_for_buy(desired_sl, old_sl):
@@ -282,7 +278,7 @@ def manage_trade(trade):
         try:
             set_trailing_stop(trade_id, pair, TRAILING_DISTANCE_PIPS)
         except Exception as e:
-            logging.warning(f"Trailing stop update failed for {trade_id}: {e}")
+            logging.warning(f"Trailing stop update failed for trade {trade_id}: {e}")
 
 
 def manage_all_trades_loop():
@@ -312,6 +308,7 @@ def webhook():
             return jsonify({"status": "error", "message": "Missing required env vars"}), 500
 
         data = request.get_json(force=True, silent=True) or {}
+
         passphrase = str(data.get("passphrase", ""))
         pair = str(data.get("pair", "")).upper().strip()
         action = str(data.get("action", "")).lower().strip()
@@ -324,7 +321,7 @@ def webhook():
         if pair not in PAIRS:
             return jsonify({"status": "error", "message": f"Invalid pair: {pair}"}), 400
 
-        if action not in ["buy", "sell"]:
+        if action not in {"buy", "sell"}:
             return jsonify({"status": "error", "message": f"Invalid action: {action}"}), 400
 
         if not in_allowed_session():
@@ -332,12 +329,15 @@ def webhook():
             return jsonify({"status": "blocked", "message": "Outside allowed session"}), 200
 
         if total_open_trades() >= MAX_TOTAL_TRADES:
+            logging.info("BLOCKED: max total trades reached")
             return jsonify({"status": "blocked", "message": "Max total trades reached"}), 200
 
         if len(get_open_trades_for_pair(pair)) >= MAX_TRADES_PER_PAIR:
+            logging.info(f"BLOCKED: max trades reached for {pair}")
             return jsonify({"status": "blocked", "message": f"Max trades reached for {pair}"}), 200
 
         if has_open_trade_same_direction(pair, action):
+            logging.info(f"BLOCKED: same direction trade already open on {pair}")
             return jsonify({"status": "blocked", "message": f"Same direction trade already open on {pair}"}), 200
 
         response = place_trade(pair, action)
@@ -345,9 +345,12 @@ def webhook():
 
     except Exception as e:
         logging.error(f"WEBHOOK ERROR: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 200
 
 
+# =========================
+# START BACKGROUND MANAGER
+# =========================
 manager_thread = threading.Thread(target=manage_all_trades_loop, daemon=True)
 manager_thread.start()
 
