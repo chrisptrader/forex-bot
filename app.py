@@ -1,19 +1,41 @@
-from flask import Flask, request, jsonify
-import os
-import requests
-import threading
-import time
+# --- CORE ---
+WEBHOOK_PASSPHRASE=1234
+OANDA_ENV=practice
 
-app = Flask(__name__)
+# --- PAIRS ---
+PAIRS=EUR_USD,GBP_USD,USD_JPY
 
-# =========================
-# CONFIG
-# =========================
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
-OANDA_ENV = os.getenv("OANDA_ENV", "practice").strip().lower()
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234").strip()
+# --- POSITION SIZE (SAFE MODE) ---
+FIXED_UNITS=10000
+FALLBACK_UNITS=10000
+MAX_UNITS=10000
+RISK_PERCENT=0
 
-BASE_URL = "https://api-fxpractice.oanda.com/v3" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com/v3"
+# --- TRADE CONTROL ---
+MAX_OPEN_TRADES=1
+MAX_TOTAL_OPEN_TRADES=2
+MAX_TRADES_PER_PAIR=1
+MIN_SECONDS_BETWEEN_TRADES=900
 
-PAIRS = [p.strip().upper() for p in os.getenv("PAIRS
+# --- RISK MANAGEMENT ---
+STOP_LOSS_PIPS=10
+TAKE_PROFIT_PIPS=12
+MAX_DAILY_LOSS_PERCENT=3
+
+# --- SPREAD / ENTRY FILTERS ---
+MAX_SPREAD_PIPS=2.5
+MIN_CANDLE_RANGE_PIPS=2
+TREND_STRENGTH_MIN=15
+
+# --- BREAK EVEN ---
+USE_BREAK_EVEN=true
+BREAK_EVEN_TRIGGER_PIPS=4
+BREAK_EVEN_PLUS_PIPS=1
+
+# --- TRAILING STOP ---
+USE_TRAILING_STOP=true
+TRAILING_TRIGGER_PIPS=6
+TRAILING_DISTANCE_PIPS=3
+
+# --- EXECUTION ---
+MANAGE_INTERVAL_SECONDS=10
