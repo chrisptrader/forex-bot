@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from flask import Flask, request, jsonify
 
@@ -14,10 +13,13 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
 
-FIXED_UNITS = int(os.getenv("FIXED_UNITS", "15000"))
+FIXED_UNITS = int(os.getenv("FIXED_UNITS", "35000"))
 
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "20"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "80"))
+
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
+ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
 
 USE_BREAK_EVEN = os.getenv("USE_BREAK_EVEN", "true").lower() == "true"
 BREAK_EVEN_TRIGGER_PIPS = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", "8"))
@@ -31,8 +33,14 @@ USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "true").lower() == "true"
 TRAIL_TRIGGER_PIPS = float(os.getenv("TRAIL_TRIGGER_PIPS", "20"))
 TRAIL_DISTANCE_PIPS = float(os.getenv("TRAIL_DISTANCE_PIPS", "10"))
 
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
-ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
+USE_PAIR_WHITELIST = os.getenv("USE_PAIR_WHITELIST", "true").lower() == "true"
+ALLOWED_PAIRS = os.getenv(
+    "ALLOWED_PAIRS",
+    "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF,EUR_JPY,GBP_JPY"
+).replace(" ", "").split(",")
+
+USE_CORRELATION_FILTER = os.getenv("USE_CORRELATION_FILTER", "true").lower() == "true"
+MAX_SAME_BIAS_TRADES = int(os.getenv("MAX_SAME_BIAS_TRADES", "2"))
 
 # =========================
 # OANDA URL
@@ -48,24 +56,18 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# memory so partial close does not repeat
 PARTIAL_DONE = set()
-
 
 # =========================
 # HELPERS
 # =========================
 
 def pip_size(pair):
-    if "JPY" in pair:
-        return 0.01
-    return 0.0001
+    return 0.01 if "JPY" in pair else 0.0001
 
 
 def round_price(pair, price):
-    if "JPY" in pair:
-        return round(price, 3)
-    return round(price, 5)
+    return round(price, 3) if "JPY" in pair else round(price, 5)
 
 
 def get_price(pair):
@@ -89,16 +91,70 @@ def get_open_trades():
     return data.get("trades", [])
 
 
+def count_open_trades():
+    return len(get_open_trades())
+
+
 def has_trade_for_pair(pair):
-    trades = get_open_trades()
-    for trade in trades:
+    for trade in get_open_trades():
         if trade["instrument"] == pair:
             return True
     return False
 
 
-def count_open_trades():
-    return len(get_open_trades())
+def usd_bias(pair, action):
+    """
+    Returns:
+    USD_STRONG = trade benefits from USD strength
+    USD_WEAK = trade benefits from USD weakness
+    OTHER = cross pair / not clear
+    """
+
+    action = action.lower()
+
+    if pair.endswith("_USD"):
+        if action == "buy":
+            return "USD_WEAK"
+        if action == "sell":
+            return "USD_STRONG"
+
+    if pair.startswith("USD_"):
+        if action == "buy":
+            return "USD_STRONG"
+        if action == "sell":
+            return "USD_WEAK"
+
+    return "OTHER"
+
+
+def trade_usd_bias(trade):
+    pair = trade["instrument"]
+    units = int(float(trade["currentUnits"]))
+    action = "buy" if units > 0 else "sell"
+    return usd_bias(pair, action)
+
+
+def correlation_blocked(pair, action):
+    if not USE_CORRELATION_FILTER:
+        return False, "correlation filter off"
+
+    new_bias = usd_bias(pair, action)
+
+    if new_bias == "OTHER":
+        return False, "cross pair allowed"
+
+    same_bias_count = 0
+
+    for trade in get_open_trades():
+        existing_bias = trade_usd_bias(trade)
+
+        if existing_bias == new_bias:
+            same_bias_count += 1
+
+    if same_bias_count >= MAX_SAME_BIAS_TRADES:
+        return True, f"too many trades with same USD bias: {new_bias}"
+
+    return False, "allowed"
 
 
 def calculate_sl_tp(pair, action, entry):
@@ -124,7 +180,7 @@ def place_trade(pair, action):
         units = -FIXED_UNITS
         entry = bid
     else:
-        return {"error": "Invalid action"}
+        return {"error": "invalid action"}
 
     sl, tp = calculate_sl_tp(pair, action, entry)
 
@@ -148,30 +204,24 @@ def place_trade(pair, action):
 
     url = f"{OANDA_URL}/accounts/{OANDA_ACCOUNT_ID}/orders"
     r = requests.post(url, headers=HEADERS, json=order, timeout=10)
-
     return r.json()
 
 
 def close_partial(trade_id, units_to_close):
     url = f"{OANDA_URL}/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
-    payload = {
-        "units": str(abs(int(units_to_close)))
-    }
-
+    payload = {"units": str(abs(int(units_to_close)))}
     r = requests.put(url, headers=HEADERS, json=payload, timeout=10)
     return r.json()
 
 
 def modify_trade_sl(trade_id, pair, new_sl):
     url = f"{OANDA_URL}/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders"
-
     payload = {
         "stopLoss": {
             "timeInForce": "GTC",
             "price": str(round_price(pair, new_sl))
         }
     }
-
     r = requests.put(url, headers=HEADERS, json=payload, timeout=10)
     return r.json()
 
@@ -205,13 +255,9 @@ def manage_trades():
         bid, ask, mid = get_price(pair)
         pip = pip_size(pair)
         profit_pips = get_profit_pips(trade, bid, ask)
-
         direction = "buy" if units > 0 else "sell"
 
-        # =========================
         # BREAK EVEN
-        # =========================
-
         if USE_BREAK_EVEN and profit_pips >= BREAK_EVEN_TRIGGER_PIPS:
             if direction == "buy":
                 new_sl = entry + BREAK_EVEN_PLUS_PIPS * pip
@@ -229,14 +275,10 @@ def manage_trades():
                 "response": response
             })
 
-        # =========================
         # PARTIAL TAKE PROFIT
-        # =========================
-
         if USE_PARTIAL_TP and profit_pips >= PARTIAL_TP_TRIGGER_PIPS:
             if trade_id not in PARTIAL_DONE:
-                close_units = abs(units) * (PARTIAL_TP_PERCENT / 100)
-                close_units = int(close_units)
+                close_units = int(abs(units) * (PARTIAL_TP_PERCENT / 100))
 
                 if close_units >= 1:
                     response = close_partial(trade_id, close_units)
@@ -251,10 +293,7 @@ def manage_trades():
                         "response": response
                     })
 
-        # =========================
         # TRAILING STOP
-        # =========================
-
         if USE_TRAILING_STOP and profit_pips >= TRAIL_TRIGGER_PIPS:
             if direction == "buy":
                 trail_sl = bid - TRAIL_DISTANCE_PIPS * pip
@@ -274,22 +313,25 @@ def manage_trades():
 
     return results
 
-
 # =========================
 # ROUTES
 # =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "V39 appy running ✅"
+    return "V40 appy running ✅ correlation protection active"
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "version": "v39",
-        "env": OANDA_ENV
+        "version": "v40",
+        "env": OANDA_ENV,
+        "fixed_units": FIXED_UNITS,
+        "allowed_pairs": ALLOWED_PAIRS,
+        "correlation_filter": USE_CORRELATION_FILTER,
+        "max_same_bias_trades": MAX_SAME_BIAS_TRADES
     })
 
 
@@ -298,6 +340,7 @@ def manage():
     results = manage_trades()
     return jsonify({
         "status": "managed",
+        "version": "v40",
         "results": results
     })
 
@@ -320,13 +363,25 @@ def webhook():
     pair = pair.upper()
     action = action.lower()
 
-    # manage existing trades first
+    if action not in ["buy", "sell"]:
+        return jsonify({"error": "action must be buy or sell"}), 400
+
     manage_results = manage_trades()
+
+    if USE_PAIR_WHITELIST and pair not in ALLOWED_PAIRS:
+        return jsonify({
+            "status": "blocked",
+            "reason": "pair not allowed in V40 whitelist",
+            "pair": pair,
+            "allowed_pairs": ALLOWED_PAIRS,
+            "manage_results": manage_results
+        })
 
     if count_open_trades() >= MAX_OPEN_TRADES:
         return jsonify({
             "status": "blocked",
             "reason": "max open trades reached",
+            "max_open_trades": MAX_OPEN_TRADES,
             "manage_results": manage_results
         })
 
@@ -338,15 +393,28 @@ def webhook():
             "manage_results": manage_results
         })
 
+    blocked, reason = correlation_blocked(pair, action)
+
+    if blocked:
+        return jsonify({
+            "status": "blocked",
+            "reason": reason,
+            "pair": pair,
+            "action": action,
+            "manage_results": manage_results
+        })
+
     response = place_trade(pair, action)
 
     print("ORDER RESPONSE:", response, flush=True)
 
     return jsonify({
         "status": "trade_sent",
+        "version": "v40",
         "pair": pair,
         "action": action,
         "units": FIXED_UNITS,
+        "usd_bias": usd_bias(pair, action),
         "manage_results": manage_results,
         "order_response": response
     })
