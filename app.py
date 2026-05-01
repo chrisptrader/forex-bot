@@ -15,9 +15,15 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
 
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.5"))
-MAX_DAILY_LOSS_PERCENT = float(os.getenv("MAX_DAILY_LOSS_PERCENT", "3"))
+# Adaptive Risk
+BASE_RISK_PERCENT = float(os.getenv("BASE_RISK_PERCENT", "2.0"))
+MAX_RISK_PERCENT = float(os.getenv("MAX_RISK_PERCENT", "2.5"))
+MIN_RISK_PERCENT = float(os.getenv("MIN_RISK_PERCENT", "1.2"))
 
+WIN_STEP = float(os.getenv("WIN_STREAK_STEP", "0.15"))
+LOSS_STEP = float(os.getenv("LOSS_STREAK_STEP", "0.25"))
+
+# Core
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "20"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "60"))
 
@@ -39,11 +45,6 @@ ALLOWED_PAIRS = os.getenv(
 
 MAX_SAME_BIAS_TRADES = int(os.getenv("MAX_SAME_BIAS_TRADES", "1"))
 
-# Trade management
-BREAK_EVEN_TRIGGER = 8
-PARTIAL_TP_TRIGGER = 15
-TRAIL_TRIGGER = 20
-
 # =========================
 
 BASE = "https://api-fxtrade.oanda.com/v3" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com/v3"
@@ -52,6 +53,14 @@ HEADERS = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
     "Content-Type": "application/json"
 }
+
+# =========================
+# STATE (adaptive)
+# =========================
+
+win_streak = 0
+loss_streak = 0
+current_risk = BASE_RISK_PERCENT
 
 trade_count_today = 0
 last_trade_time = None
@@ -81,10 +90,10 @@ def get_balance():
 
 def calculate_units(pair):
     balance = get_balance()
-    risk = balance * (RISK_PERCENT / 100)
-    pip = pip_size(pair)
-    pip_value = 0.0001 if "JPY" not in pair else 0.01
-    return int(risk / (STOP_LOSS_PIPS * pip_value))
+    risk = balance * (current_risk / 100)
+
+    pip_val = 0.0001 if "JPY" not in pair else 0.01
+    return int(risk / (STOP_LOSS_PIPS * pip_val))
 
 
 def usd_bias(pair, action):
@@ -101,13 +110,10 @@ def correlation_block(pair, action):
         return False
 
     count = 0
-    trades = get_open_trades()
-
-    for t in trades:
+    for t in get_open_trades():
         p = t["instrument"]
         u = int(float(t["currentUnits"]))
         a = "buy" if u > 0 else "sell"
-
         if usd_bias(p, a) == new_bias:
             count += 1
 
@@ -136,16 +142,35 @@ def can_trade():
         last_day = now.date()
 
     if trade_count_today >= MAX_TRADES_PER_DAY:
-        return False, "daily trade cap"
+        return False, "daily cap"
 
     if last_trade_time:
         if (now - last_trade_time).total_seconds() < MIN_SECONDS_BETWEEN_TRADES:
             return False, "cooldown"
 
     if not in_session():
-        return False, "outside session"
+        return False, "session"
 
     return True, "ok"
+
+
+# =========================
+# ADAPTIVE RISK UPDATE
+# =========================
+
+def update_risk(win):
+    global win_streak, loss_streak, current_risk
+
+    if win:
+        win_streak += 1
+        loss_streak = 0
+        current_risk += WIN_STEP
+    else:
+        loss_streak += 1
+        win_streak = 0
+        current_risk -= LOSS_STEP
+
+    current_risk = max(MIN_RISK_PERCENT, min(MAX_RISK_PERCENT, current_risk))
 
 
 # =========================
@@ -164,46 +189,39 @@ def manage_trades():
         bid, ask = get_price(pair)
         pip = pip_size(pair)
 
-        if units > 0:
-            profit = (bid - entry) / pip
-        else:
-            profit = (entry - ask) / pip
+        profit = (bid - entry)/pip if units > 0 else (entry - ask)/pip
 
         # BREAK EVEN
-        if profit >= BREAK_EVEN_TRIGGER:
+        if profit >= 8:
             new_sl = entry + pip if units > 0 else entry - pip
             requests.put(f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
                          headers=HEADERS,
                          json={"stopLoss": {"price": str(round(new_sl, 5))}})
 
-        # PARTIAL CLOSE
-        if profit >= PARTIAL_TP_TRIGGER and trade_id not in partial_done:
-            close_units = int(abs(units) * 0.5)
+        # PARTIAL
+        if profit >= 15 and trade_id not in partial_done:
+            close_units = int(abs(units)*0.5)
             if close_units > 0:
                 requests.put(f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close",
                              headers=HEADERS,
                              json={"units": str(close_units)})
                 partial_done.add(trade_id)
 
-        # TRAILING
-        if profit >= TRAIL_TRIGGER:
-            trail = bid - 10 * pip if units > 0 else ask + 10 * pip
+        # TRAIL
+        if profit >= 20:
+            trail = bid - 10*pip if units > 0 else ask + 10*pip
             requests.put(f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders",
                          headers=HEADERS,
                          json={"stopLoss": {"price": str(round(trail, 5))}})
 
-
 # =========================
-# ROUTES
+# ROUTE
 # =========================
-
-@app.route("/")
-def home():
-    return "V46 LIVE 🔥"
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global trade_count_today, last_trade_time
+
     data = request.json
 
     if data.get("passphrase") != WEBHOOK_PASSPHRASE:
@@ -215,7 +233,7 @@ def webhook():
     manage_trades()
 
     if pair not in ALLOWED_PAIRS:
-        return {"blocked": "pair not allowed"}
+        return {"blocked": "pair"}
 
     ok, reason = can_trade()
     if not ok:
@@ -231,30 +249,25 @@ def webhook():
 
     if action == "buy":
         entry = ask
-        sl = entry - STOP_LOSS_PIPS * pip
-        tp = entry + TAKE_PROFIT_PIPS * pip
+        sl = entry - STOP_LOSS_PIPS*pip
+        tp = entry + TAKE_PROFIT_PIPS*pip
     else:
         units = -units
         entry = bid
-        sl = entry + STOP_LOSS_PIPS * pip
-        tp = entry - TAKE_PROFIT_PIPS * pip
-
-    order = {
-        "order": {
-            "instrument": pair,
-            "units": str(units),
-            "type": "MARKET",
-            "stopLossOnFill": {"price": str(round(sl, 5))},
-            "takeProfitOnFill": {"price": str(round(tp, 5))}
-        }
-    }
+        sl = entry + STOP_LOSS_PIPS*pip
+        tp = entry - TAKE_PROFIT_PIPS*pip
 
     requests.post(f"{BASE}/accounts/{OANDA_ACCOUNT_ID}/orders",
                   headers=HEADERS,
-                  json=order)
+                  json={"order": {
+                      "instrument": pair,
+                      "units": str(units),
+                      "type": "MARKET",
+                      "stopLossOnFill": {"price": str(round(sl,5))},
+                      "takeProfitOnFill": {"price": str(round(tp,5))}
+                  }})
 
-    return {"status": "trade placed", "pair": pair}
+    trade_count_today += 1
+    last_trade_time = datetime.now(pytz.timezone(TIMEZONE))
 
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    return {"status": "trade placed", "risk": current_risk}
