@@ -1,105 +1,237 @@
 from flask import Flask, request, jsonify
-import os, time
+import os
+import time
+import requests
 
 app = Flask(__name__)
 
-# ===== ENV =====
-PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE")
+# =========================
+# ENV
+# =========================
+OANDA_API_KEY = os.getenv("OANDA_API_KEY")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "1234")
 
-ALLOW_BUY = os.getenv("ALLOW_BUY") == "true"
-ALLOW_SELL = os.getenv("ALLOW_SELL") == "true"
-ALLOW_MULTIPAIR = os.getenv("ALLOW_MULTIPAIR") == "true"
+BASE_URL = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
 
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 2))
-ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR") == "true"
-MIN_SECONDS_BETWEEN_TRADES = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", 300))
+ALLOW_BUY = os.getenv("ALLOW_BUY", "true").lower() == "true"
+ALLOW_SELL = os.getenv("ALLOW_SELL", "true").lower() == "true"
+ALLOW_MULTIPAIR = os.getenv("ALLOW_MULTIPAIR", "true").lower() == "true"
+ALLOWED_PAIRS = [p.strip() for p in os.getenv("ALLOWED_PAIRS", "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CHF").split(",")]
 
-TREND_MIN = float(os.getenv("TREND_STRENGTH_MIN", 20))
-CHOP_MAX = float(os.getenv("CHOP_RANGE_PIPS", 12))
+USE_RISK_PERCENT = os.getenv("USE_RISK_PERCENT", "false").lower() == "true"
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
+FIXED_UNITS = int(float(os.getenv("FIXED_UNITS", "15000")))
 
-DEBUG = os.getenv("DEBUG_BLOCK_REASONS") == "true"
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
+MIN_SECONDS_BETWEEN_TRADES = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "300"))
+DUPLICATE_SECONDS = int(os.getenv("DUPLICATE_SECONDS", "5"))
 
-# ===== MEMORY =====
+STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "20"))
+TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "60"))
+
+DEBUG_BLOCK_REASONS = os.getenv("DEBUG_BLOCK_REASONS", "true").lower() == "true"
+
+last_signal_time = {}
 last_trade_time = {}
-open_trades = {}
 
-# ===== MOCK FILTERS (replace with real data later) =====
-def get_trend_strength(pair):
-    return 18  # simulate
+# =========================
+# HELPERS
+# =========================
+def log(msg):
+    print(msg, flush=True)
 
-def get_chop_range(pair):
-    return 10  # simulate
+def block(pair, action, reason):
+    if DEBUG_BLOCK_REASONS:
+        log(f"❌ BLOCKED | {pair} | {action} | {reason}")
+    return jsonify({"status": "blocked", "reason": reason}), 200
 
-def get_open_trades():
-    return len(open_trades)
+def pip_size(pair):
+    return 0.01 if pair.endswith("_JPY") else 0.0001
 
-# ===== LOGGING =====
-def log_block(pair, action, reason, extra=""):
-    if DEBUG:
-        print(f"❌ BLOCKED | {pair} | {action} | {reason} {extra}")
+def headers():
+    return {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-def log_execute(pair, action):
-    print(f"✅ TRADE EXECUTED | {pair} | {action}")
+def get_price(pair):
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    r = requests.get(url, headers=headers(), params={"instruments": pair}, timeout=10)
+    r.raise_for_status()
+    data = r.json()["prices"][0]
+    bid = float(data["bids"][0]["price"])
+    ask = float(data["asks"][0]["price"])
+    return bid, ask
 
-# ===== ROUTE =====
+def get_open_positions():
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/openPositions"
+    r = requests.get(url, headers=headers(), timeout=10)
+    r.raise_for_status()
+    return r.json().get("positions", [])
+
+def has_open_pair(pair):
+    for pos in get_open_positions():
+        if pos.get("instrument") == pair:
+            long_units = float(pos.get("long", {}).get("units", 0))
+            short_units = float(pos.get("short", {}).get("units", 0))
+            if long_units != 0 or short_units != 0:
+                return True
+    return False
+
+def open_trade_count():
+    count = 0
+    for pos in get_open_positions():
+        long_units = float(pos.get("long", {}).get("units", 0))
+        short_units = float(pos.get("short", {}).get("units", 0))
+        if long_units != 0 or short_units != 0:
+            count += 1
+    return count
+
+def get_account_balance():
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
+    r = requests.get(url, headers=headers(), timeout=10)
+    r.raise_for_status()
+    return float(r.json()["account"]["balance"])
+
+def calc_units(pair):
+    if not USE_RISK_PERCENT:
+        return FIXED_UNITS
+
+    balance = get_account_balance()
+    risk_dollars = balance * (RISK_PERCENT / 100)
+
+    # Simple estimate. Safer than oversizing. JPY still handled.
+    if pair.endswith("_JPY"):
+        units = int((risk_dollars / STOP_LOSS_PIPS) * 100)
+    else:
+        units = int((risk_dollars / STOP_LOSS_PIPS) * 10000)
+
+    return max(1000, units)
+
+def place_trade(pair, action):
+    bid, ask = get_price(pair)
+    pip = pip_size(pair)
+
+    entry = ask if action == "buy" else bid
+
+    if action == "buy":
+        units = abs(calc_units(pair))
+        sl = entry - (STOP_LOSS_PIPS * pip)
+        tp = entry + (TAKE_PROFIT_PIPS * pip)
+    else:
+        units = -abs(calc_units(pair))
+        sl = entry + (STOP_LOSS_PIPS * pip)
+        tp = entry - (TAKE_PROFIT_PIPS * pip)
+
+    precision = 3 if pair.endswith("_JPY") else 5
+
+    order = {
+        "order": {
+            "type": "MARKET",
+            "instrument": pair,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {
+                "price": str(round(sl, precision))
+            },
+            "takeProfitOnFill": {
+                "price": str(round(tp, precision))
+            }
+        }
+    }
+
+    url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
+    r = requests.post(url, headers=headers(), json=order, timeout=10)
+
+    log(f"ORDER RESPONSE: {r.text}")
+
+    if r.status_code not in [200, 201]:
+        log(f"❌ TRADE FAILED | {pair} | {action}")
+        return False, r.text
+
+    log(f"✅ TRADE EXECUTED | {pair} | {action} | units={units}")
+    return True, r.json()
+
+# =========================
+# ROUTES
+# =========================
+@app.route("/", methods=["GET"])
+def home():
+    return "V51 running"
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    try:
+        data = request.get_json(force=True)
 
-    if data.get("passphrase") != PASSPHRASE:
-        return jsonify({"error": "unauthorized"}), 403
+        pair = str(data.get("pair", "")).upper().strip()
+        action = str(data.get("action", "")).lower().strip()
+        passphrase = str(data.get("passphrase", ""))
 
-    pair = data.get("pair")
-    action = data.get("action")
+        log(f"📩 SIGNAL | {pair} | {action}")
 
-    print(f"\n📩 SIGNAL | {pair} | {action}")
+        if passphrase != WEBHOOK_PASSPHRASE:
+            return block(pair, action, "bad passphrase")
 
-    # ===== BUY/SELL FILTER =====
-    if action == "buy" and not ALLOW_BUY:
-        log_block(pair, action, "buy disabled")
-        return "blocked"
+        if pair not in ALLOWED_PAIRS:
+            return block(pair, action, "pair not allowed")
 
-    if action == "sell" and not ALLOW_SELL:
-        log_block(pair, action, "sell disabled")
-        return "blocked"
+        if action not in ["buy", "sell"]:
+            return block(pair, action, "bad action")
 
-    # ===== MAX TRADES =====
-    if get_open_trades() >= MAX_OPEN_TRADES:
-        log_block(pair, action, "max trades reached")
-        return "blocked"
+        if action == "buy" and not ALLOW_BUY:
+            return block(pair, action, "buy disabled")
 
-    # ===== ONE TRADE PER PAIR =====
-    if ONE_TRADE_PER_PAIR and pair in open_trades:
-        log_block(pair, action, "already in trade")
-        return "blocked"
+        if action == "sell" and not ALLOW_SELL:
+            return block(pair, action, "sell disabled")
 
-    # ===== COOLDOWN =====
-    now = time.time()
-    if pair in last_trade_time:
-        if now - last_trade_time[pair] < MIN_SECONDS_BETWEEN_TRADES:
-            log_block(pair, action, "cooldown active")
-            return "blocked"
+        now = time.time()
+        signal_key = f"{pair}_{action}"
 
-    # ===== TREND FILTER =====
-    trend = get_trend_strength(pair)
-    if trend < TREND_MIN:
-        log_block(pair, action, "weak trend", f"{trend} < {TREND_MIN}")
-        return "blocked"
+        # duplicate protection
+        if signal_key in last_signal_time:
+            if now - last_signal_time[signal_key] < DUPLICATE_SECONDS:
+                return block(pair, action, "duplicate signal")
 
-    # ===== CHOP FILTER =====
-    chop = get_chop_range(pair)
-    if chop > CHOP_MAX:
-        log_block(pair, action, "choppy market", f"{chop} > {CHOP_MAX}")
-        return "blocked"
+        last_signal_time[signal_key] = now
 
-    # ===== EXECUTE TRADE =====
-    open_trades[pair] = True
-    last_trade_time[pair] = now
+        # cooldown protection
+        if pair in last_trade_time:
+            if now - last_trade_time[pair] < MIN_SECONDS_BETWEEN_TRADES:
+                return block(pair, action, "cooldown active")
 
-    log_execute(pair, action)
+        # open trade protection
+        current_open = open_trade_count()
 
-    return jsonify({"status": "executed"})
-    
-# ===== START =====
+        if current_open >= MAX_OPEN_TRADES:
+            return block(pair, action, f"max open trades reached {current_open}/{MAX_OPEN_TRADES}")
+
+        if ONE_TRADE_PER_PAIR and has_open_pair(pair):
+            return block(pair, action, "already open on this pair")
+
+        if not ALLOW_MULTIPAIR and current_open > 0:
+            return block(pair, action, "multipair disabled and trade already open")
+
+        success, response = place_trade(pair, action)
+
+        if success:
+            last_trade_time[pair] = now
+            last_trade_time[signal_key] = now
+            return jsonify({"status": "executed", "pair": pair, "action": action}), 200
+
+        return jsonify({"status": "failed", "response": str(response)}), 200
+
+    except Exception as e:
+        log(f"❌ ERROR: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
