@@ -22,14 +22,12 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 2))
 ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true") == "true"
 COOLDOWN_SECONDS = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", 90))
 
-# ===== SIZE =====
 FIXED_UNITS = int(os.getenv("FIXED_UNITS", 25000))
 
-# ===== ENTRY =====
-SL_PIPS = float(os.getenv("STOP_LOSS_PIPS", 12))
+SL_PIPS = float(os.getenv("STOP_LOSS_PIPS", 15))
 TP_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", 60))
+MIN_MOVE_PIPS = float(os.getenv("MIN_MOVE_PIPS", 3))
 
-# ===== MANAGEMENT =====
 USE_BREAK_EVEN = os.getenv("USE_BREAK_EVEN", "true") == "true"
 BREAK_EVEN_TRIGGER = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", 8))
 BREAK_EVEN_PLUS = float(os.getenv("BREAK_EVEN_PLUS_PIPS", 2))
@@ -48,6 +46,8 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", 10))
 # STATE
 # =============================
 last_trade_time = {}
+last_signal_price = {}
+partial_closed = set()
 
 headers = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
@@ -57,10 +57,16 @@ headers = {
 # =============================
 # HELPERS
 # =============================
+def pip_size(pair):
+    return 0.01 if "JPY" in pair else 0.0001
+
+def round_price(pair, price):
+    return round(price, 3 if "JPY" in pair else 5)
+
 def get_price(pair):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
     r = requests.get(url, headers=headers).json()
-    return float(r['prices'][0]['bids'][0]['price'])
+    return float(r["prices"][0]["bids"][0]["price"])
 
 def get_open_trades():
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
@@ -69,12 +75,12 @@ def get_open_trades():
 
 def close_partial(trade_id, units):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/close"
-    requests.put(url, headers=headers, json={"units": str(units)})
+    return requests.put(url, headers=headers, json={"units": str(abs(int(units)))})
 
-def modify_sl(trade_id, price):
+def modify_sl(pair, trade_id, price):
     url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
-    requests.put(url, headers=headers, json={
-        "stopLoss": {"price": str(round(price, 5))}
+    return requests.put(url, headers=headers, json={
+        "stopLoss": {"price": str(round_price(pair, price))}
     })
 
 # =============================
@@ -93,28 +99,25 @@ def trade_manager():
 
                 price = get_price(pair)
                 direction = 1 if units > 0 else -1
-                pips = (price - entry) * 10000 * direction
+                pips = ((price - entry) / pip_size(pair)) * direction
 
-                print(f"[MANAGER] {pair} | {round(pips,1)} pips")
+                print(f"[MANAGER] {pair} | {round(pips, 1)} pips")
 
-                # ===== BREAK EVEN =====
                 if USE_BREAK_EVEN and pips >= BREAK_EVEN_TRIGGER:
-                    new_sl = entry + (BREAK_EVEN_PLUS / 10000 * direction)
-                    modify_sl(trade_id, new_sl)
-                    print(f"[BE] {pair}")
+                    new_sl = entry + (BREAK_EVEN_PLUS * pip_size(pair) * direction)
+                    modify_sl(pair, trade_id, new_sl)
+                    print(f"[BE MOVED] {pair} | +{BREAK_EVEN_PLUS} pips")
 
-                # ===== PARTIAL =====
-                if USE_PARTIAL_CLOSE and pips >= PARTIAL_TRIGGER:
-                    close_units = int(abs(units) * (PARTIAL_PERCENT / 100))
-                    close_units = close_units if units > 0 else -close_units
+                if USE_PARTIAL_CLOSE and pips >= PARTIAL_TRIGGER and trade_id not in partial_closed:
+                    close_units = abs(int(units)) * (PARTIAL_PERCENT / 100)
                     close_partial(trade_id, close_units)
-                    print(f"[PARTIAL] {pair}")
+                    partial_closed.add(trade_id)
+                    print(f"[PARTIAL CLOSED] {pair} | {PARTIAL_PERCENT}%")
 
-                # ===== TRAILING =====
                 if USE_TRAILING_STOP and pips >= TRAILING_TRIGGER:
-                    new_sl = price - (TRAILING_DISTANCE / 10000 * direction)
-                    modify_sl(trade_id, new_sl)
-                    print(f"[TRAILING] {pair}")
+                    new_sl = price - (TRAILING_DISTANCE * pip_size(pair) * direction)
+                    modify_sl(pair, trade_id, new_sl)
+                    print(f"[TRAILING] {pair} | distance {TRAILING_DISTANCE} pips")
 
         except Exception as e:
             print("Manager error:", e)
@@ -126,7 +129,7 @@ def trade_manager():
 # =============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.json or {}
 
     if data.get("passphrase") != WEBHOOK_PASSPHRASE:
         print("❌ INVALID PASSPHRASE")
@@ -137,47 +140,56 @@ def webhook():
 
     print(f"📩 SIGNAL | {pair} | {action}")
 
+    if not pair or action not in ["buy", "sell"]:
+        print("❌ BLOCKED | bad signal format")
+        return "bad signal"
+
     now = time.time()
     trades = get_open_trades()
 
-    # ===== COOLDOWN =====
     if pair in last_trade_time:
         remaining = COOLDOWN_SECONDS - (now - last_trade_time[pair])
         if remaining > 0:
-            print(f"❌ BLOCKED | cooldown ({round(remaining,1)}s left)")
+            print(f"❌ BLOCKED | cooldown | {pair} | {round(remaining, 1)}s left")
             return "cooldown"
 
-    # ===== MAX TRADES =====
     if len(trades) >= MAX_OPEN_TRADES:
-        print(f"❌ BLOCKED | max trades ({len(trades)})")
-        return "max"
+        print(f"❌ BLOCKED | max trades | open={len(trades)} max={MAX_OPEN_TRADES}")
+        return "max trades"
 
-    # ===== ONE PER PAIR =====
     if ONE_TRADE_PER_PAIR:
         for t in trades:
             if t["instrument"] == pair:
-                print(f"❌ BLOCKED | already open ({pair})")
+                print(f"❌ BLOCKED | already open | {pair}")
                 return "duplicate"
 
-    # ===== BUY/SELL FILTER =====
     if action == "buy" and not ALLOW_BUY:
-        print("❌ BUY DISABLED")
+        print("❌ BLOCKED | buy disabled")
         return "buy disabled"
 
     if action == "sell" and not ALLOW_SELL:
-        print("❌ SELL DISABLED")
+        print("❌ BLOCKED | sell disabled")
         return "sell disabled"
 
-    # ===== EXECUTE =====
     price = get_price(pair)
 
+    if pair in last_signal_price:
+        move_pips = abs(price - last_signal_price[pair]) / pip_size(pair)
+
+        if move_pips < MIN_MOVE_PIPS:
+            print(f"❌ BLOCKED | no movement | {pair} | {round(move_pips, 1)} pips < {MIN_MOVE_PIPS}")
+            last_signal_price[pair] = price
+            return "no movement"
+
+    last_signal_price[pair] = price
+
     if action == "buy":
-        sl = price - (SL_PIPS / 10000)
-        tp = price + (TP_PIPS / 10000)
+        sl = price - (SL_PIPS * pip_size(pair))
+        tp = price + (TP_PIPS * pip_size(pair))
         units = FIXED_UNITS
     else:
-        sl = price + (SL_PIPS / 10000)
-        tp = price - (TP_PIPS / 10000)
+        sl = price + (SL_PIPS * pip_size(pair))
+        tp = price - (TP_PIPS * pip_size(pair))
         units = -FIXED_UNITS
 
     order = {
@@ -186,8 +198,8 @@ def webhook():
             "units": str(units),
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": str(round(sl, 5))},
-            "takeProfitOnFill": {"price": str(round(tp, 5))}
+            "stopLossOnFill": {"price": str(round_price(pair, sl))},
+            "takeProfitOnFill": {"price": str(round_price(pair, tp))}
         }
     }
 
@@ -195,7 +207,7 @@ def webhook():
     r = requests.post(url, headers=headers, json=order)
 
     if r.status_code == 201:
-        print(f"✅ TRADE EXECUTED | {pair}")
+        print(f"✅ TRADE EXECUTED | {pair} | {action} | units={units}")
         last_trade_time[pair] = now
     else:
         print("❌ ORDER ERROR:", r.text)
