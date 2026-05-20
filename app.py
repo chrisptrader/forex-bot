@@ -1,73 +1,54 @@
-import os
-import time
-import threading
-from flask import Flask, request
-import requests
+import os, time, threading, requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# =============================
-# CONFIG
-# =============================
+OANDA_API_KEY = (os.getenv("OANDA_API_KEY") or "").strip()
+ACCOUNT_ID = (os.getenv("OANDA_ACCOUNT_ID") or os.getenv("ACCOUNT_ID") or "").strip()
+OANDA_ENV = (os.getenv("OANDA_ENV") or "live").strip().lower()
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
-ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+BASE_URL = "https://api-fxtrade.oanda.com/v3" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com/v3"
 
-# LIVE / PRACTICE AUTO SWITCH
-OANDA_ENV = os.getenv("OANDA_ENV", "practice").strip().lower()
-
-if OANDA_ENV == "live":
-    BASE_URL = "https://api-fxtrade.oanda.com/v3"
-else:
-    BASE_URL = "https://api-fxpractice.oanda.com/v3"
-
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "").strip()
+WEBHOOK_PASSPHRASE = (os.getenv("WEBHOOK_PASSPHRASE") or "").strip()
 
 ALLOW_BUY = os.getenv("ALLOW_BUY", "true").lower() == "true"
 ALLOW_SELL = os.getenv("ALLOW_SELL", "true").lower() == "true"
 
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 2))
 ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
-
 COOLDOWN_SECONDS = int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", 90))
 
-FIXED_UNITS = int(os.getenv("FIXED_UNITS", 25000))
+FIXED_UNITS = int(os.getenv("FIXED_UNITS", 1000))
 
-SL_PIPS = float(os.getenv("STOP_LOSS_PIPS", 15))
-TP_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", 60))
-
-MIN_MOVE_PIPS = float(os.getenv("MIN_MOVE_PIPS", 3))
+SL_PIPS = float(os.getenv("STOP_LOSS_PIPS", 10))
+TP_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", 28))
+MIN_MOVE_PIPS = float(os.getenv("MIN_MOVE_PIPS", 4))
 
 USE_BREAK_EVEN = os.getenv("USE_BREAK_EVEN", "true").lower() == "true"
-BREAK_EVEN_TRIGGER = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", 8))
-BREAK_EVEN_PLUS = float(os.getenv("BREAK_EVEN_PLUS_PIPS", 2))
+BREAK_EVEN_TRIGGER = float(os.getenv("BREAK_EVEN_TRIGGER_PIPS", 6))
+BREAK_EVEN_PLUS = float(os.getenv("BREAK_EVEN_PLUS_PIPS", 1))
 
 USE_PARTIAL_CLOSE = os.getenv("USE_PARTIAL_CLOSE", "true").lower() == "true"
 PARTIAL_TRIGGER = float(os.getenv("PARTIAL_CLOSE_TRIGGER_PIPS", 18))
 PARTIAL_PERCENT = float(os.getenv("PARTIAL_CLOSE_PERCENT", 50))
 
 USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "true").lower() == "true"
-TRAILING_TRIGGER = float(os.getenv("TRAILING_TRIGGER_PIPS", 15))
+TRAILING_TRIGGER = float(os.getenv("TRAILING_TRIGGER_PIPS", 14))
 TRAILING_DISTANCE = float(os.getenv("TRAILING_DISTANCE_PIPS", 7))
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", 10))
-
-# =============================
-# STATE
-# =============================
 
 last_trade_time = {}
 last_signal_price = {}
 partial_closed = set()
 
+session = requests.Session()
+session.trust_env = False
+
 headers = {
     "Authorization": f"Bearer {OANDA_API_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
 }
-
-# =============================
-# HELPERS
-# =============================
 
 def pip_size(pair):
     return 0.01 if "JPY" in pair else 0.0001
@@ -75,331 +56,187 @@ def pip_size(pair):
 def round_price(pair, price):
     return round(price, 3 if "JPY" in pair else 5)
 
-def safe_json(response):
+def oanda_get(path, params=None):
+    url = f"{BASE_URL}{path}"
+    r = session.get(url, headers=headers, params=params, timeout=5)
     try:
-        return response.json()
-    except:
-        return {}
+        data = r.json()
+    except Exception:
+        data = {"error": r.text}
+    if r.status_code >= 400:
+        print("❌ OANDA GET ERROR:", r.status_code, data)
+        return None
+    return data
+
+def oanda_post(path, payload):
+    url = f"{BASE_URL}{path}"
+    r = session.post(url, headers=headers, json=payload, timeout=8)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text}
+    return r.status_code, data
+
+def oanda_put(path, payload):
+    url = f"{BASE_URL}{path}"
+    r = session.put(url, headers=headers, json=payload, timeout=5)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"error": r.text}
+    return r.status_code, data
 
 def get_price(pair):
-
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/pricing?instruments={pair}"
-
-    r = requests.get(
-        url,
-        headers=headers,
-        timeout=10
-    )
-
-    data = safe_json(r)
-
-    if "prices" not in data:
-        print("❌ PRICE ERROR:", data)
-        raise Exception("No prices returned")
-
+    data = oanda_get(f"/accounts/{ACCOUNT_ID}/pricing", {"instruments": pair})
+    if not data or "prices" not in data:
+        print(f"❌ PRICE ERROR | {pair} | response={data}")
+        return None
     return float(data["prices"][0]["bids"][0]["price"])
 
 def get_open_trades():
-
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/openTrades"
-
-    r = requests.get(
-        url,
-        headers=headers,
-        timeout=10
-    )
-
-    data = safe_json(r)
-
-    if "trades" not in data:
-        print("❌ OPEN TRADES ERROR:", data)
+    data = oanda_get(f"/accounts/{ACCOUNT_ID}/openTrades")
+    if not data:
         return []
-
     return data.get("trades", [])
 
 def close_partial(trade_id, units):
-
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/close"
-
-    return requests.put(
-        url,
-        headers=headers,
-        json={"units": str(abs(int(units)))},
-        timeout=10
-    )
+    return oanda_put(f"/accounts/{ACCOUNT_ID}/trades/{trade_id}/close", {
+        "units": str(abs(int(units)))
+    })
 
 def modify_sl(pair, trade_id, price):
-
-    url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders"
-
-    return requests.put(
-        url,
-        headers=headers,
-        json={
-            "stopLoss": {
-                "price": str(round_price(pair, price))
-            }
-        },
-        timeout=10
-    )
-
-# =============================
-# TRADE MANAGER
-# =============================
+    return oanda_put(f"/accounts/{ACCOUNT_ID}/trades/{trade_id}/orders", {
+        "stopLoss": {"price": str(round_price(pair, price))}
+    })
 
 def trade_manager():
-
     while True:
-
         try:
-
             trades = get_open_trades()
 
             for t in trades:
-
                 trade_id = t["id"]
                 pair = t["instrument"]
-
                 entry = float(t["price"])
                 units = float(t["currentUnits"])
 
                 price = get_price(pair)
+                if price is None:
+                    continue
 
                 direction = 1 if units > 0 else -1
+                pips = ((price - entry) / pip_size(pair)) * direction
 
-                pips = (
-                    (price - entry)
-                    / pip_size(pair)
-                ) * direction
+                print(f"[MANAGER] {pair} | {round(pips, 1)} pips")
 
-                print(f"[MANAGER] {pair} | {round(pips,1)} pips")
-
-                # BREAK EVEN
                 if USE_BREAK_EVEN and pips >= BREAK_EVEN_TRIGGER:
-
-                    new_sl = entry + (
-                        BREAK_EVEN_PLUS
-                        * pip_size(pair)
-                        * direction
-                    )
-
+                    new_sl = entry + (BREAK_EVEN_PLUS * pip_size(pair) * direction)
                     modify_sl(pair, trade_id, new_sl)
-
                     print(f"[BE MOVED] {pair}")
 
-                # PARTIAL CLOSE
-                if (
-                    USE_PARTIAL_CLOSE
-                    and pips >= PARTIAL_TRIGGER
-                    and trade_id not in partial_closed
-                ):
-
-                    close_units = abs(int(units)) * (
-                        PARTIAL_PERCENT / 100
-                    )
-
+                if USE_PARTIAL_CLOSE and pips >= PARTIAL_TRIGGER and trade_id not in partial_closed:
+                    close_units = abs(int(units)) * (PARTIAL_PERCENT / 100)
                     close_partial(trade_id, close_units)
-
                     partial_closed.add(trade_id)
-
                     print(f"[PARTIAL CLOSED] {pair}")
 
-                # TRAILING STOP
                 if USE_TRAILING_STOP and pips >= TRAILING_TRIGGER:
-
-                    if direction == 1:
-
-                        new_sl = price - (
-                            TRAILING_DISTANCE
-                            * pip_size(pair)
-                        )
-
-                    else:
-
-                        new_sl = price + (
-                            TRAILING_DISTANCE
-                            * pip_size(pair)
-                        )
-
+                    new_sl = price - (TRAILING_DISTANCE * pip_size(pair) * direction)
                     modify_sl(pair, trade_id, new_sl)
-
                     print(f"[TRAILING] {pair}")
 
         except Exception as e:
-
-            print("Manager error:", str(e))
+            print("Manager error:", e)
 
         time.sleep(POLL_SECONDS)
 
-# =============================
-# WEBHOOK
-# =============================
+@app.route("/", methods=["GET"])
+def home():
+    return "LIVE BOT ONLINE"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    data = request.json or {}
 
-    try:
+    if data.get("passphrase") != WEBHOOK_PASSPHRASE:
+        print("❌ INVALID PASSPHRASE")
+        return jsonify({"status": "invalid passphrase"}), 403
 
-        data = request.json or {}
+    pair = data.get("pair")
+    action = data.get("action")
 
-        if data.get("passphrase") != WEBHOOK_PASSPHRASE:
-            print("❌ INVALID PASSPHRASE")
-            return "invalid"
+    print(f"📩 SIGNAL | {pair} | {action}")
 
-        pair = data.get("pair")
-        action = data.get("action")
+    if not pair or action not in ["buy", "sell"]:
+        return jsonify({"status": "bad signal"}), 400
 
-        print(f"📩 SIGNAL | {pair} | {action}")
+    if action == "buy" and not ALLOW_BUY:
+        return jsonify({"status": "buy disabled"}), 200
 
-        if not pair or action not in ["buy", "sell"]:
-            return "bad signal"
+    if action == "sell" and not ALLOW_SELL:
+        return jsonify({"status": "sell disabled"}), 200
 
-        now = time.time()
+    now = time.time()
 
-        trades = get_open_trades()
+    if pair in last_trade_time:
+        remaining = COOLDOWN_SECONDS - (now - last_trade_time[pair])
+        if remaining > 0:
+            print(f"❌ BLOCKED | cooldown | {round(remaining,1)}s")
+            return jsonify({"status": "cooldown"}), 200
 
-        # COOLDOWN
-        if pair in last_trade_time:
+    trades = get_open_trades()
 
-            remaining = COOLDOWN_SECONDS - (
-                now - last_trade_time[pair]
-            )
+    if len(trades) >= MAX_OPEN_TRADES:
+        print("❌ BLOCKED | max trades")
+        return jsonify({"status": "max trades"}), 200
 
-            if remaining > 0:
-                print(f"❌ COOLDOWN | {pair}")
-                return "cooldown"
+    if ONE_TRADE_PER_PAIR:
+        for t in trades:
+            if t["instrument"] == pair:
+                print("❌ BLOCKED | duplicate pair")
+                return jsonify({"status": "duplicate"}), 200
 
-        # MAX OPEN TRADES
-        if len(trades) >= MAX_OPEN_TRADES:
-            print("❌ MAX OPEN TRADES")
-            return "max trades"
+    price = get_price(pair)
+    if price is None:
+        return jsonify({"status": "price error"}), 200
 
-        # ONE TRADE PER PAIR
-        if ONE_TRADE_PER_PAIR:
+    if pair in last_signal_price:
+        move_pips = abs(price - last_signal_price[pair]) / pip_size(pair)
+        if move_pips < MIN_MOVE_PIPS:
+            last_signal_price[pair] = price
+            print(f"❌ BLOCKED | no movement | {round(move_pips,1)} pips")
+            return jsonify({"status": "no movement"}), 200
 
-            for t in trades:
+    last_signal_price[pair] = price
 
-                if t["instrument"] == pair:
-                    print(f"❌ DUPLICATE | {pair}")
-                    return "duplicate"
+    if action == "buy":
+        units = FIXED_UNITS
+        sl = price - SL_PIPS * pip_size(pair)
+        tp = price + TP_PIPS * pip_size(pair)
+    else:
+        units = -FIXED_UNITS
+        sl = price + SL_PIPS * pip_size(pair)
+        tp = price - TP_PIPS * pip_size(pair)
 
-        # BUY / SELL ENABLED
-        if action == "buy" and not ALLOW_BUY:
-            return "buy disabled"
-
-        if action == "sell" and not ALLOW_SELL:
-            return "sell disabled"
-
-        price = get_price(pair)
-
-        # MIN MOVE FILTER
-        if pair in last_signal_price:
-
-            move_pips = abs(
-                price - last_signal_price[pair]
-            ) / pip_size(pair)
-
-            if move_pips < MIN_MOVE_PIPS:
-
-                print(f"❌ NO MOVEMENT | {pair}")
-
-                last_signal_price[pair] = price
-
-                return "no movement"
-
-        last_signal_price[pair] = price
-
-        # BUILD ORDER
-        if action == "buy":
-
-            sl = price - (
-                SL_PIPS * pip_size(pair)
-            )
-
-            tp = price + (
-                TP_PIPS * pip_size(pair)
-            )
-
-            units = FIXED_UNITS
-
-        else:
-
-            sl = price + (
-                SL_PIPS * pip_size(pair)
-            )
-
-            tp = price - (
-                TP_PIPS * pip_size(pair)
-            )
-
-            units = -FIXED_UNITS
-
-        order = {
-            "order": {
-                "instrument": pair,
-                "units": str(units),
-                "type": "MARKET",
-                "positionFill": "DEFAULT",
-                "stopLossOnFill": {
-                    "price": str(round_price(pair, sl))
-                },
-                "takeProfitOnFill": {
-                    "price": str(round_price(pair, tp))
-                }
-            }
+    order = {
+        "order": {
+            "instrument": pair,
+            "units": str(units),
+            "type": "MARKET",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": str(round_price(pair, sl))},
+            "takeProfitOnFill": {"price": str(round_price(pair, tp))}
         }
+    }
 
-        url = f"{BASE_URL}/accounts/{ACCOUNT_ID}/orders"
+    status, result = oanda_post(f"/accounts/{ACCOUNT_ID}/orders", order)
 
-        r = requests.post(
-            url,
-            headers=headers,
-            json=order,
-            timeout=10
-        )
+    if status in [200, 201]:
+        print(f"✅ TRADE EXECUTED | {pair} | {action} | units={units}")
+        last_trade_time[pair] = now
+        return jsonify({"status": "executed", "pair": pair, "action": action}), 200
 
-        result = safe_json(r)
+    print("❌ ORDER ERROR:", status, result)
+    return jsonify({"status": "order error", "details": result}), 200
 
-        if r.status_code in [200, 201]:
-
-            print(f"✅ TRADE EXECUTED | {pair} | {action}")
-
-            last_trade_time[pair] = now
-
-            return "ok"
-
-        else:
-
-            print("❌ ORDER ERROR:", result)
-
-            return "order failed"
-
-    except Exception as e:
-
-        print("❌ WEBHOOK ERROR:", str(e))
-
-        return "server error"
-
-# =============================
-# HOME
-# =============================
-
-@app.route("/")
-def home():
-    return "Forex bot is live"
-
-# =============================
-# START
-# =============================
-
-threading.Thread(
-    target=trade_manager,
-    daemon=True
-).start()
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=10000
-    )
+threading.Thread(target=trade_manager, daemon=True).start()
